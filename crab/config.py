@@ -97,12 +97,18 @@ class StorageConfig:
     root_dir: Path
     manifests_dirname: str = "manifests"
     artifacts_dirname: str = "artifacts"
+    journal_dirname: str = "journal"
+    cassettes_dirname: str = "cassettes"
 
     def __post_init__(self) -> None:
         if not self.manifests_dirname:
             raise ValueError("manifests_dirname must be non-empty")
         if not self.artifacts_dirname:
             raise ValueError("artifacts_dirname must be non-empty")
+        if not self.journal_dirname:
+            raise ValueError("journal_dirname must be non-empty")
+        if not self.cassettes_dirname:
+            raise ValueError("cassettes_dirname must be non-empty")
 
 
 @dataclass(frozen=True)

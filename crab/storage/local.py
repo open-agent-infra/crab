@@ -12,7 +12,6 @@ from ..contracts import CheckpointManager
 from ..ids import CheckpointId, SandboxId
 from ..json_codec import get_json_codec
 from ..models import ArtifactPayload, ArtifactReference, CheckpointManifest
-from ..runtime import CommandRunner, SubprocessCommandRunner
 
 logger = logging.getLogger(__name__)
 _STORAGE_JSON_CODEC = get_json_codec("auto")
@@ -33,16 +32,13 @@ class LocalCheckpointManager(CheckpointManager):
         self,
         config: StorageConfig,
         *,
-        command_runner: CommandRunner | None = None,
-        zfs_bin: str = "zfs",
         runtime_image_path_in_use: Callable[[Path], bool] | None = None,
+        destroy_filesystem_ref: Callable[[str], None] | None = None,
     ):
         self._config = config
         self._root = Path(config.root_dir)
         self._manifests_root = self._root / config.manifests_dirname
         self._artifacts_root = self._root / config.artifacts_dirname
-        self._runner = command_runner or SubprocessCommandRunner()
-        self._zfs_bin = zfs_bin
         # Optional runtime-side predicate consulted before ``shutil.rmtree``-ing
         # a runtime checkpoint tree. Returns True when the tree (or a
         # descendant) is the on-disk image source for an active runtime
@@ -54,8 +50,24 @@ class LocalCheckpointManager(CheckpointManager):
         # will reclaim it. None means "no safety check installed" (e.g.
         # in-memory tests, runtimes without lazy-pages support).
         self._runtime_image_path_in_use = runtime_image_path_in_use
+        # Runtime-side hook that destroys a filesystem checkpoint by its
+        # opaque fs_ref (routed to the runtime's filesystem provider).
+        # Storage used to shell out `zfs destroy` itself; backend-specific
+        # commands now live behind the provider. None means "no hook
+        # installed" (in-memory tests, runtimes without fs checkpoints) —
+        # retention then skips snapshot cleanup and logs at debug.
+        self._destroy_filesystem_ref = destroy_filesystem_ref
         self._manifests_root.mkdir(parents=True, exist_ok=True)
         self._artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    def set_destroy_filesystem_ref(
+        self,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        """Late-bind the filesystem-ref destroy hook. Used when storage is
+        constructed before the runtime instance is available (same
+        pattern as ``set_runtime_image_path_in_use``)."""
+        self._destroy_filesystem_ref = callback
 
     def set_runtime_image_path_in_use(
         self,
@@ -480,29 +492,35 @@ class LocalCheckpointManager(CheckpointManager):
         shutil.rmtree(path, ignore_errors=True)
 
     def _delete_filesystem_runtime_paths(self, payload: dict[str, object]) -> None:
-        snapshot = None
+        # Prefer the backend-neutral fs_ref; fall back to the legacy bare
+        # `snapshot` key so checkpoints written before the fs_ref cutover
+        # (and their retention) keep working. The provider accepts both
+        # spellings.
+        fs_ref = None
         filesystem = payload.get("filesystem", {})
         if isinstance(filesystem, dict):
-            snapshot = filesystem.get("snapshot")
-        if snapshot is None:
+            fs_ref = filesystem.get("fs_ref") or filesystem.get("snapshot")
+        if fs_ref is None:
             status = payload.get("status", {})
             if isinstance(status, dict):
                 metadata = status.get("metadata", {})
                 if isinstance(metadata, dict):
-                    snapshot = metadata.get("snapshot")
-        if snapshot is None:
+                    fs_ref = metadata.get("fs_ref") or metadata.get("snapshot")
+        if fs_ref is None:
             return
-        result = self._runner.run([self._zfs_bin, "destroy", str(snapshot)])
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            if "dataset does not exist" in stderr or "snapshot does not exist" in stderr:
-                return
-            logger.warning(
-                "Failed to destroy filesystem snapshot %s rc=%d stderr=%s",
-                snapshot,
-                result.returncode,
-                stderr,
+        destroy = self._destroy_filesystem_ref
+        if destroy is None:
+            logger.debug(
+                "No destroy_filesystem_ref hook installed; skipping filesystem checkpoint cleanup for %s",
+                fs_ref,
             )
+            return
+        try:
+            destroy(str(fs_ref))
+        except Exception:
+            # Retention is best-effort; a failed snapshot destroy must not
+            # wedge manifest/artifact deletion.
+            logger.exception("destroy_filesystem_ref hook raised for %s", fs_ref)
 
     def _prune_empty_parents(self, start: Path, *, stop: Path) -> None:
         current = start

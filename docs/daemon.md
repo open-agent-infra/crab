@@ -44,6 +44,13 @@ crab [--socket PATH] [--timeout SECONDS] [--json] <command>
   sandbox run [OPTIONS] IMAGE [-- COMMAND ...]
   sandbox ls
   sandbox exec SANDBOX_ID [OPTIONS] -- COMMAND ...
+  sandbox fork SANDBOX_ID [-n COUNT] [--lazy] [--effects allow|reject]
+  sandbox merge SOURCE_ID FORK_ID [--policy POLICY] [--ignore-prefix PREFIX]
+  sandbox changeset SANDBOX_ID [--since CHECKPOINT_ID]
+  sandbox consolidate SOURCE_ID FORK_ID [--policy append|dedupe|none]
+  sandbox merge-processes SOURCE_ID FORK_ID [--strategy auto|replay|promote]
+  sandbox egress SANDBOX_ID [--txn TXN_ID] [--since-seq N]
+  sandbox actions SANDBOX_ID [--kind KIND] [--limit N]
   sandbox stop|pause|resume SANDBOX_ID
   sandbox rm SANDBOX_ID [SANDBOX_ID ...]
 
@@ -51,6 +58,11 @@ crab [--socket PATH] [--timeout SECONDS] [--json] <command>
   checkpoint ls SANDBOX_ID
   checkpoint rm SANDBOX_ID CHECKPOINT_ID [--cascade]
   restore SANDBOX_ID CHECKPOINT_ID
+
+  txn begin SANDBOX_ID [--label LABEL] [--isolation snapshot|fork]
+  txn commit SANDBOX_ID TXN_ID [--force]
+  txn abort SANDBOX_ID TXN_ID
+  txn status SANDBOX_ID
 ```
 
 Run `crab <group> <command> --help` for the authoritative option list.
@@ -147,7 +159,10 @@ root or ZFS pool.
 ## Current limitations
 
 - one root-owned, single-user daemon per host;
-- no remote or multi-host daemon API;
+- no remote daemon API on the daemon itself — remote/multi-tenant access
+  goes through `crab-gateway` and the SDK's cloud mode
+  (`Engine.connect(url=..., api_key=...)`); the Unix socket stays the
+  only daemon ingress;
 - no restart rehydration;
 - no exec streaming or PTY;
 - no rootless runc/CRIU/ZFS backend;

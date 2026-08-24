@@ -22,22 +22,7 @@ from crab import (
     StorageConfig,
 )
 from crab.models import utc_now
-from crab.runtime import CommandRunner
 from crab.workers.composite import resolve_restore_manifest
-
-
-class FakeCommandRunner(CommandRunner):
-    def __init__(self) -> None:
-        self.commands: list[tuple[str, ...]] = []
-
-    def run(self, command: list[str], *, cwd: Path | None = None):
-        _ = cwd
-        self.commands.append(tuple(command))
-        return type(
-            "Result",
-            (),
-            {"command": tuple(command), "returncode": 0, "stdout": "", "stderr": ""},
-        )()
 
 
 class StorageTests(unittest.TestCase):
@@ -208,8 +193,11 @@ class StorageTests(unittest.TestCase):
     def test_delete_checkpoint_removes_manifest_artifacts_and_runtime_refs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
             root = Path(tmp)
-            runner = FakeCommandRunner()
-            mgr = LocalCheckpointManager(StorageConfig(root_dir=root), command_runner=runner)
+            destroyed_refs: list[str] = []
+            mgr = LocalCheckpointManager(
+                StorageConfig(root_dir=root),
+                destroy_filesystem_ref=destroyed_refs.append,
+            )
             sid = SandboxId("sbx-1")
             ckpt = CheckpointId("ckpt-1")
             process_dir = root / "runtime" / str(sid) / str(ckpt) / "process"
@@ -256,7 +244,83 @@ class StorageTests(unittest.TestCase):
             self.assertFalse((root / "manifests" / str(sid) / f"{ckpt}.json").exists())
             self.assertFalse((root / "artifacts" / str(sid) / str(ckpt)).exists())
             self.assertFalse(process_dir.parent.exists())
-            self.assertEqual(runner.commands, [("zfs", "destroy", "pool/crab/sbx-1@ckpt-1")])
+            # Legacy payload (pre-fs_ref) carries only the bare `snapshot`
+            # key; retention forwards it verbatim to the runtime hook, and
+            # the zfs provider accepts the unprefixed spelling.
+            self.assertEqual(destroyed_refs, ["pool/crab/sbx-1@ckpt-1"])
+
+    def test_delete_checkpoint_prefers_fs_ref_over_legacy_snapshot_key(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
+            root = Path(tmp)
+            destroyed_refs: list[str] = []
+            mgr = LocalCheckpointManager(
+                StorageConfig(root_dir=root),
+                destroy_filesystem_ref=destroyed_refs.append,
+            )
+            sid = SandboxId("sbx-1")
+            ckpt = CheckpointId("ckpt-1")
+            fs_ref = mgr.put_artifact(
+                sid,
+                ckpt,
+                ArtifactPayload(
+                    kind=ArtifactKind.FILESYSTEM,
+                    name="filesystem_checkpoint.json",
+                    data=b'{"filesystem": {"fs_ref": "zfs:pool/crab/sbx-1@ckpt-1", "snapshot": "pool/crab/sbx-1@ckpt-1"}}',
+                ),
+            )
+            mgr.put_manifest(
+                CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=ckpt,
+                    sandbox_id=sid,
+                    created_at=utc_now(),
+                    runtime_name="runc",
+                    runtime_version=None,
+                    process_artifacts=[],
+                    filesystem_artifacts=[fs_ref],
+                    metadata={},
+                ).with_integrity()
+            )
+
+            mgr.delete_checkpoint(sid, ckpt)
+
+            self.assertEqual(destroyed_refs, ["zfs:pool/crab/sbx-1@ckpt-1"])
+
+    def test_delete_checkpoint_without_destroy_hook_still_removes_manifest(self) -> None:
+        # In-memory setups (and runtimes without filesystem checkpoints)
+        # install no destroy hook; retention must still remove the manifest
+        # and artifacts instead of wedging on snapshot cleanup.
+        with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:
+            root = Path(tmp)
+            mgr = LocalCheckpointManager(StorageConfig(root_dir=root))
+            sid = SandboxId("sbx-1")
+            ckpt = CheckpointId("ckpt-1")
+            fs_ref = mgr.put_artifact(
+                sid,
+                ckpt,
+                ArtifactPayload(
+                    kind=ArtifactKind.FILESYSTEM,
+                    name="filesystem_checkpoint.json",
+                    data=b'{"filesystem": {"fs_ref": "zfs:pool/crab/sbx-1@ckpt-1"}}',
+                ),
+            )
+            mgr.put_manifest(
+                CheckpointManifest(
+                    schema_version="v1",
+                    checkpoint_id=ckpt,
+                    sandbox_id=sid,
+                    created_at=utc_now(),
+                    runtime_name="runc",
+                    runtime_version=None,
+                    process_artifacts=[],
+                    filesystem_artifacts=[fs_ref],
+                    metadata={},
+                ).with_integrity()
+            )
+
+            mgr.delete_checkpoint(sid, ckpt)
+
+            self.assertFalse((root / "manifests" / str(sid) / f"{ckpt}.json").exists())
 
     def test_latest_only_manager_prunes_older_checkpoints(self) -> None:
         with tempfile.TemporaryDirectory(prefix="crab_storage_") as tmp:

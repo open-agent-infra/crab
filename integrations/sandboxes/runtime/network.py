@@ -4,7 +4,7 @@ import ipaddress
 import heapq
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import subprocess
 import threading
@@ -117,6 +117,7 @@ class BenchmarkNetworkManager:
         self._ip_to_sandbox: dict[str, SandboxId] = {}
         self._lock = threading.Lock()
         self._nat_rules_configured = False
+        self._egress_redirect_port: int | None = None
 
     @property
     def bridge_ip(self) -> str:
@@ -220,6 +221,66 @@ class BenchmarkNetworkManager:
                 check=True,
             )
         self._nat_rules_configured = True
+
+    def enable_egress_redirect(self, proxy_port: int) -> None:
+        """Redirect all sandbox-originated TCP egress into the host-side
+        egress proxy (roadmap D1). Traffic aimed at the host itself is
+        excluded, so the LLM interceptor/forwarder/daemon paths stay
+        byte-identical — that exclusion is what makes "LLM interception
+        unchanged" a property of the rule rather than a hope.
+
+        Idempotent; must be called after ``ensure_bridge``.
+        """
+        with self._lock:
+            bridge_name = self._bridge_name
+            if bridge_name is None:
+                raise RuntimeError("egress redirect requires the bridge (call ensure_bridge first)")
+            if self._egress_redirect_port == int(proxy_port):
+                return
+            rule = self._egress_redirect_rule(bridge_name, int(proxy_port))
+            if subprocess.run(
+                ["iptables", "-t", "nat", "-C", *rule],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode != 0:
+                subprocess.run(["iptables", "-t", "nat", "-A", *rule], check=True)
+            self._egress_redirect_port = int(proxy_port)
+        logger.info(
+            "Enabled egress redirect bridge=%s proxy_port=%d (host-bound traffic excluded)",
+            bridge_name,
+            int(proxy_port),
+        )
+
+    def disable_egress_redirect(self) -> None:
+        with self._lock:
+            bridge_name = self._bridge_name
+            port = self._egress_redirect_port
+            self._egress_redirect_port = None
+        if bridge_name is None or port is None:
+            return
+        subprocess.run(
+            ["iptables", "-t", "nat", "-D", *self._egress_redirect_rule(bridge_name, port)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _egress_redirect_rule(self, bridge_name: str, proxy_port: int) -> list[str]:
+        return [
+            "PREROUTING",
+            "-i",
+            bridge_name,
+            "-p",
+            "tcp",
+            "!",
+            "-d",
+            self._bridge_ip,
+            "-j",
+            "REDIRECT",
+            "--to-ports",
+            str(proxy_port),
+        ]
 
     def allocate_lease(self, sandbox_id: SandboxId) -> BenchmarkNetworkLease:
         self.ensure_bridge()
@@ -360,22 +421,60 @@ class BenchmarkNetworkManager:
         )
         return True
 
+    def transfer_lease(
+        self, from_sandbox_id: SandboxId, to_sandbox_id: SandboxId
+    ) -> BenchmarkNetworkLease | None:
+        """Move ``from``'s lease onto ``to``'s identity, destroying whatever
+        lease ``to`` held before. Returns the re-keyed lease, or ``None``
+        when ``from`` holds none (which makes a repeated call a no-op).
+
+        Promotion (B3 commit, C4 promote) restores a fork's CRIU image onto
+        the source's identity. The image's sockets are bound to the *fork's*
+        guest IP, so unless that address moves with them CRIU's ``soccr``
+        fails to bind them back (``EADDRNOTAVAIL``) and the restore dies.
+
+        Ordering is load-bearing: `release_lease` pops by sandbox id and
+        then tears down whatever it popped, so the outgoing record must
+        leave the table *before* the incoming one takes its key. Re-keying
+        first and releasing afterwards would destroy the netns just
+        transferred in.
+        """
+        with self._lock:
+            incoming = self._leases.get(from_sandbox_id)
+            if incoming is None:
+                return None
+            # 1. the outgoing record leaves the table first.
+            outgoing = self._leases.pop(to_sandbox_id, None)
+            if outgoing is not None:
+                self._ip_to_sandbox.pop(outgoing.guest_ip, None)
+                self._recycle_guest_ip_locked(outgoing.guest_ip)
+            # 2. re-key the incoming record onto the target identity.
+            del self._leases[from_sandbox_id]
+            transferred = replace(incoming, sandbox_id=to_sandbox_id)
+            self._leases[to_sandbox_id] = transferred
+            # 3. attribution follows the address.
+            self._ip_to_sandbox[transferred.guest_ip] = to_sandbox_id
+        # 4. only the popped record's plumbing is destroyed, outside the lock.
+        if outgoing is not None:
+            self._destroy_lease_plumbing(outgoing)
+        logger.info(
+            "Transferred benchmark network lease from=%s to=%s guest_ip=%s namespace=%s",
+            from_sandbox_id,
+            to_sandbox_id,
+            transferred.guest_ip,
+            transferred.namespace_name,
+        )
+        return transferred
+
     def release_lease(self, sandbox_id: SandboxId) -> None:
         with self._lock:
             lease = self._leases.pop(sandbox_id, None)
             if lease is not None:
                 self._ip_to_sandbox.pop(lease.guest_ip, None)
-                network = ipaddress.ip_network(self._network_cidr, strict=False)
-                try:
-                    guest_index = int(ipaddress.ip_address(lease.guest_ip)) - int(network.network_address)
-                except ValueError:
-                    guest_index = -1
-                if 2 <= guest_index < network.num_addresses - 1:
-                    heapq.heappush(self._free_ip_indices, guest_index)
+                self._recycle_guest_ip_locked(lease.guest_ip)
         if lease is None:
             return
-        subprocess.run(["ip", "netns", "del", lease.namespace_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["ip", "link", "delete", lease.host_veth_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self._destroy_lease_plumbing(lease)
         logger.info(
             "Released benchmark network lease sandbox=%s guest_ip=%s namespace=%s",
             sandbox_id,
@@ -383,7 +482,23 @@ class BenchmarkNetworkManager:
             lease.namespace_name,
         )
 
+    def _recycle_guest_ip_locked(self, guest_ip: str) -> None:
+        """Return a freed address to the allocation pool. Caller holds the lock."""
+        network = ipaddress.ip_network(self._network_cidr, strict=False)
+        try:
+            guest_index = int(ipaddress.ip_address(guest_ip)) - int(network.network_address)
+        except ValueError:
+            guest_index = -1
+        if 2 <= guest_index < network.num_addresses - 1:
+            heapq.heappush(self._free_ip_indices, guest_index)
+
+    @staticmethod
+    def _destroy_lease_plumbing(lease: BenchmarkNetworkLease) -> None:
+        subprocess.run(["ip", "netns", "del", lease.namespace_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(["ip", "link", "delete", lease.host_veth_name], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def cleanup(self) -> None:
+        self.disable_egress_redirect()
         with self._lock:
             sandbox_ids = list(self._leases)
             bridge_name = self._bridge_name

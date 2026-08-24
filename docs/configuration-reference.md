@@ -28,6 +28,26 @@ storage_planes:
 
 - `runtime`: `runc` is the real v0 backend. `docker` selects an in-memory test
   implementation; it is not a Docker checkpoint/restore fallback.
+- `filesystem_backend`: CoW backend for sandbox root filesystems: `zfs`
+  (default), `btrfs`, or `overlay`. Also accepted as a nested block:
+  `filesystem: {backend: btrfs, btrfs: {root: ..., qgroups_enabled: false},
+  overlay: {root: ...}}`.
+- `btrfs_root`: mountpoint of the btrfs filesystem holding sandbox
+  subvolumes (default `/var/lib/crab/btrfs`). Only used with
+  `filesystem_backend: btrfs`; the mount must already exist (the installer's
+  `--fs-backend btrfs` prepares it).
+- `overlay_root`: btrfs-backed area for the overlay backend's per-sandbox
+  upper/work subvolumes, shared lowers, and snapshot mounts (default
+  `<btrfs_root>/overlay`, so a btrfs-prepared host needs no extra setup).
+  Overlay constraints: sandboxes actively reference their shared image
+  lower at runtime (do not delete a shared cache under live sandboxes),
+  nested container engines inside the sandbox are unsupported on overlay
+  roots (the kernel rejects overlay-upon-overlay uppers — use zfs/btrfs),
+  and qgroups byte stats cover the upper subvolume only ("written since
+  launch").
+- `btrfs_qgroups_enabled`: enable qgroups-backed per-snapshot byte stats
+  (measurable overhead; default `false`, stats degrade to unknown). Also
+  governs the overlay backend's stats.
 - `zfs_dataset_prefix`: parent dataset for sandbox root filesystems. Name it
   explicitly; do not rely on automatic pool discovery in production.
 - `storage_root`: checkpoint manifests and artifact metadata.

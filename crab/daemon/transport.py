@@ -18,6 +18,7 @@ import http.client
 import json
 import logging
 import os
+import shutil
 import socket
 import socketserver
 import stat
@@ -87,6 +88,20 @@ class _UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
     allow_reuse_address = True
     daemon_threads = True
 
+    def __init__(
+        self,
+        server_address: str,
+        handler_factory,
+        *,
+        socket_perms: int = DEFAULT_SOCKET_PERMS,
+        socket_group: str | None = None,
+    ) -> None:
+        # `BaseServer.__init__` calls `server_bind` before returning, so
+        # the perms/group overrides must be attributes before `super()`.
+        self._socket_perms = int(socket_perms)
+        self._socket_group = socket_group
+        super().__init__(server_address, handler_factory)
+
     def server_bind(self) -> None:
         # Strip any stale socket file before binding so daemon restarts
         # (after a hard crash, etc.) don't fail with EADDRINUSE.
@@ -99,7 +114,11 @@ class _UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
                 pass
         path.parent.mkdir(parents=True, exist_ok=True)
         super().server_bind()
-        os.chmod(self.server_address, DEFAULT_SOCKET_PERMS)
+        # chgrp before chmod so a group-readable mode never applies to
+        # the wrong (default) group, even for one scheduling instant.
+        if self._socket_group is not None:
+            shutil.chown(self.server_address, group=self._socket_group)
+        os.chmod(self.server_address, self._socket_perms)
         self.server_name = "crab"
         self.server_port = 0
 
@@ -107,12 +126,24 @@ class _UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
 def serve_unix_socket(
     socket_path: Path,
     handler_factory,
+    *,
+    socket_perms: int = DEFAULT_SOCKET_PERMS,
+    socket_group: str | None = None,
 ) -> _UnixHTTPServer:
     """Bind a Unix-socket HTTP server at `socket_path` using `handler_factory`.
 
     Returns the server; the caller is responsible for `serve_forever` and
-    shutdown. The socket file is created with permissions 0600."""
-    server = _UnixHTTPServer(str(socket_path), handler_factory)
+    shutdown. By default the socket file is created with permissions 0600
+    (`DEFAULT_SOCKET_PERMS`) — sole-user auth, unchanged. Passing
+    `socket_group` (typically with `socket_perms=0o660`) chgrps the socket
+    so an unprivileged service user in that group — the crab-gateway — can
+    reach a root daemon without running as root."""
+    server = _UnixHTTPServer(
+        str(socket_path),
+        handler_factory,
+        socket_perms=socket_perms,
+        socket_group=socket_group,
+    )
     return server
 
 
@@ -237,3 +268,89 @@ class DaemonClient:
         if not isinstance(decoded, dict):
             raise DaemonRequestError(status_code, path, payload_bytes)
         return decoded
+
+    def stream_post(
+        self,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> "StreamIterator":
+        """POST that returns a streaming NDJSON iterator instead of reading
+        the full response body. The caller must close the iterator (or use
+        it as a context manager) to release the connection."""
+        effective = self._timeout if timeout_seconds is None else float(timeout_seconds)
+        body = b"" if payload is None else json.dumps(payload).encode("utf-8")
+        conn = _UnixHTTPConnection(self._socket_path, timeout=effective)
+        headers: dict[str, str] = {"Host": "crab"}
+        if body:
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request("POST", path, body=body, headers=headers)
+            response = conn.getresponse()
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            conn.close()
+            raise FileNotFoundError(
+                f"crab daemon not reachable at {self._socket_path} ({exc.__class__.__name__}); "
+                "start the daemon with `crab daemon start` (or "
+                "`python -m crab.daemon`)."
+            ) from exc
+        except Exception:
+            conn.close()
+            raise
+        if response.status >= 400:
+            try:
+                payload_bytes = response.read()
+            finally:
+                response.close()
+                conn.close()
+            raise DaemonRequestError(response.status, path, payload_bytes)
+        return StreamIterator(response, conn)
+
+
+class StreamIterator:
+    """Iterates over newline-delimited JSON objects from an HTTP streaming
+    response. Implements iterator and context-manager protocols."""
+
+    def __init__(self, response: http.client.HTTPResponse, conn: http.client.HTTPConnection) -> None:
+        self._response = response
+        self._conn = conn
+        self._closed = False
+
+    def __iter__(self) -> "StreamIterator":
+        return self
+
+    def __next__(self) -> dict[str, Any]:
+        if self._closed:
+            raise StopIteration
+        while True:
+            line = self._response.readline()
+            if not line:
+                self.close()
+                raise StopIteration
+            line = line.strip()
+            if not line:
+                continue
+            return json.loads(line)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._response.close()
+        except Exception:
+            pass
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "StreamIterator":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()

@@ -129,7 +129,9 @@ class FakeHostInspectorClient:
         object_id: str,
         *,
         ignore_process_rules=None,
+        ignored_path_prefixes=None,
     ) -> dict[str, object]:
+        _ = ignored_path_prefixes
         self.register_calls.append((sandbox_id, runtime, object_id, ignore_process_rules))
         return {"ok": True}
 
@@ -150,7 +152,9 @@ class FlakyHostInspectorClient(FakeHostInspectorClient):
         object_id: str,
         *,
         ignore_process_rules=None,
+        ignored_path_prefixes=None,
     ) -> dict[str, object]:
+        _ = ignored_path_prefixes
         self.register_calls.append((sandbox_id, runtime, object_id, ignore_process_rules))
         if self._failures_before_success > 0:
             self._failures_before_success -= 1
@@ -386,9 +390,11 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(manager.describe(sandbox_id).status, "stopped")
 
             manager.delete(sandbox_id)
+            # The runtime always layers its default ignore rules (criu helper
+            # writes) on top of any per-sandbox rules before registering.
             self.assertEqual(
                 host_inspector.register_calls,
-                [(SandboxId("sbx-test"), "runc", "sbx-test", None)],
+                [(SandboxId("sbx-test"), "runc", "sbx-test", [{"executable_basename": "criu"}])],
             )
             self.assertEqual(host_inspector.unregister_calls, [SandboxId("sbx-test")])
             self.assertEqual(
@@ -474,7 +480,7 @@ class SandboxManagerTests(unittest.TestCase):
                         SandboxId("sbx-restore"),
                         "runc",
                         "sbx-restore",
-                        [{"executable_basename": "node"}],
+                        [{"executable_basename": "criu"}, {"executable_basename": "node"}],
                     )
                 ],
             )
@@ -508,9 +514,9 @@ class SandboxManagerTests(unittest.TestCase):
             self.assertEqual(
                 host_inspector.register_calls,
                 [
-                    (SandboxId("sbx-retry"), "runc", "sbx-retry", None),
-                    (SandboxId("sbx-retry"), "runc", "sbx-retry", None),
-                    (SandboxId("sbx-retry"), "runc", "sbx-retry", None),
+                    (SandboxId("sbx-retry"), "runc", "sbx-retry", [{"executable_basename": "criu"}]),
+                    (SandboxId("sbx-retry"), "runc", "sbx-retry", [{"executable_basename": "criu"}]),
+                    (SandboxId("sbx-retry"), "runc", "sbx-retry", [{"executable_basename": "criu"}]),
                 ],
             )
             self.assertEqual(sleep.call_count, 2)

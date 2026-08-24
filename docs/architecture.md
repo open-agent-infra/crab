@@ -53,7 +53,18 @@ flowchart TD
 - `build_default_system(runtime="runc")` creates `RuncRuntime`.
 - Real-host scenarios also construct this directly with explicit `RuncRuntimePaths`.
 - Process state is handled through `runc checkpoint` and `runc restore` backed by CRIU image directories.
-- Filesystem state is handled through ZFS snapshots and rollbacks.
+- Filesystem state is handled through a pluggable `FilesystemProvider`
+  (`crab/runtime/fs_provider.py`). The default `ZfsProvider` maps
+  checkpoints to ZFS snapshots/rollbacks/clones; the `BtrfsProvider`
+  maps them to btrfs subvolume snapshots with an emulated rollback
+  (trash-swap) and needs no `promote` because btrfs snapshots carry no
+  clone-origin dependency. The `OverlayProvider` mounts the rootfs as
+  overlayfs — lowerdir is the shared image content (one copy per image,
+  page-cache shared across fork fleets), upperdir+workdir live in one
+  per-sandbox btrfs subvolume that inherits the btrfs snapshot/fork
+  mechanics, and the upperdir doubles as a native changeset source
+  (whiteouts and opaque markers are decoded into container semantics).
+  Select the backend with `filesystem_backend`.
 
 ## Request Interception And Checkpoint Coordination
 
@@ -158,6 +169,40 @@ Two new contracts on `CheckpointManager`:
 7. On success, the runtime marks the sandbox as restored and storage receives `handle_restore_complete(...)`.
 
 Manifest resolution is important because restore may depend on artifacts from earlier checkpoints. `resolve_restore_manifest(...)` merges the effective process and filesystem artifacts before restore workers run.
+
+## Fork Promotion And Network Identity
+
+`_promote_fork_onto_source(...)` is the shared swap behind a fork-backed
+`commit()` (B3) and a promoting `merge_processes` (C4): it restores a
+fork's checkpoint onto the source's unchanged sandbox id.
+
+When sandbox networking is on, the fork runs in its own network namespace
+with its own lease, so its dumped sockets are bound to the fork's guest
+IP. Restoring that image into the source's namespace fails in CRIU's
+`soccr` with `EADDRNOTAVAIL`, so the source **adopts the fork's network
+identity** instead. The engine hook `transfer_network_lease(...)` moves
+three things together, and treating them as one operation is the point:
+
+1. the lease record is re-keyed from the fork id to the source id
+   (`BenchmarkNetworkManager.transfer_lease`, pop-before-rekey so the
+   release of the source's old lease never tears down the netns just
+   moved in);
+2. the source bundle's `config.json` network namespace path is retargeted
+   to the fork's netns;
+3. the source's runtime metadata (`guest_ip`, `network_namespace_path`)
+   is rewritten, because the interceptor's attribution fallback and
+   `Sandbox.get_host` read it — a transfer that fixed only the lease would
+   pass socket checks while silently misattributing egress.
+
+The swap runs in two phases so nothing irreversible precedes a detectable
+failure. A pre-flight probe (before the source is stopped) decides whether
+a transfer applies and checks the source bundle exists; the transfer path
+then dumps the fork **stopped** (two live copies of a listener cannot
+share one netns) and, after the dump, fails loud rather than silently
+falling back to the lease-repair path — a fork-addressed image restored
+into the source's own netns would fail with the root cause buried. The
+source's `sandbox_id` never changes; its guest IP does. Networking-off
+promotions keep the fork running and use `lease_repair` unchanged.
 
 ## Recovery Loop
 

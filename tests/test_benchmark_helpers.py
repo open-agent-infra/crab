@@ -2119,7 +2119,10 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.network_manager.cleanup.assert_called_once_with()
         harness._task_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
-        self.assertEqual(events, ["delete_runtime", "shutdown"])
+        # task_executor.shutdown must run before runtime deletion: deleting
+        # runtimes with in-flight tasks mid-turn makes the next `runc exec`
+        # fail and hang shutdown in a restore-wait (see harness.__exit__).
+        self.assertEqual(events, ["shutdown", "delete_runtime"])
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
         harness = RealHostScenarioHarness(

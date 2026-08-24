@@ -27,8 +27,6 @@ sandboxes — the daemon stays running across SDK process exits.
 """
 from __future__ import annotations
 
-import contextlib
-import hashlib
 import logging
 import shlex
 import socket
@@ -36,10 +34,10 @@ import threading
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Iterable
 
 from .ids import CheckpointId, SandboxId
-from .models import EgressLedger, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, PortAllocation, ProcessMergeReport, SandboxExecResult, SandboxSnapshot, utc_now
+from .models import JobStatus, SandboxExecResult, SandboxSnapshot, utc_now
 from .templates import SandboxTemplate
 
 if TYPE_CHECKING:
@@ -52,138 +50,6 @@ logger = logging.getLogger(__name__)
 # Marker labels used in CheckpointId values produced by `sbx.checkpoint()`.
 # Stored in the manifest metadata so users can see what they labelled.
 _LABEL_METADATA_KEY = "user_label"
-
-
-# ---------------------------------------------------------------------------
-# Rich return types for commands.run() / commands.stream()
-# ---------------------------------------------------------------------------
-
-
-class AsyncCheckpoint:
-    """Handle for a background checkpoint. The checkpoint_id is pre-allocated
-    and immediately available; the actual checkpoint runs asynchronously."""
-
-    def __init__(self, checkpoint_id: str, thread: threading.Thread) -> None:
-        self.checkpoint_id = checkpoint_id
-        self._thread = thread
-        self._error: BaseException | None = None
-
-    def wait(self, timeout: float | None = None) -> str:
-        """Block until the checkpoint completes. Returns checkpoint_id.
-        Raises TimeoutError if *timeout* elapses, or propagates the
-        checkpoint failure exception."""
-        self._thread.join(timeout=timeout)
-        if self._thread.is_alive():
-            raise TimeoutError("checkpoint did not complete within timeout")
-        if self._error is not None:
-            raise self._error
-        return self.checkpoint_id
-
-    @property
-    def done(self) -> bool:
-        """Non-blocking check: has the background checkpoint finished?"""
-        return not self._thread.is_alive()
-
-    def __repr__(self) -> str:
-        status = "done" if self.done else "pending"
-        return f"AsyncCheckpoint(id={self.checkpoint_id!r}, {status})"
-
-
-class AsyncChangeset:
-    """Handle for a background changeset computation."""
-
-    def __init__(self, thread: threading.Thread) -> None:
-        self._thread = thread
-        self._result: list[dict] | None = None
-        self._error: BaseException | None = None
-
-    def wait(self, timeout: float | None = None) -> list[dict]:
-        """Block until the changeset completes. Returns the changeset entries."""
-        self._thread.join(timeout=timeout)
-        if self._thread.is_alive():
-            raise TimeoutError("changeset did not complete within timeout")
-        if self._error is not None:
-            raise self._error
-        return self._result or []
-
-    @property
-    def done(self) -> bool:
-        return not self._thread.is_alive()
-
-    def __repr__(self) -> str:
-        status = "done" if self.done else "pending"
-        return f"AsyncChangeset({status})"
-
-
-@dataclass
-class ActionResult:
-    """Rich return value from commands.run() / commands.stream().
-
-    Wraps the original exec result and optionally carries background
-    checkpoint/changeset handles plus inspector observations."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-    args: tuple[str, ...]
-
-    # Optional enrichments (None when not requested)
-    checkpoint: AsyncCheckpoint | None = None
-    changeset: AsyncChangeset | list[dict] | None = None
-    filesystem_changed: bool | None = None
-    process_changed: bool | None = None
-
-
-class ExecStream:
-    """Iterable wrapper for streaming exec that exposes a .result after
-    iteration completes.
-
-    Usage::
-
-        stream = sandbox.commands.stream("make test", checkpoint=True)
-        for event in stream:
-            print(event.text)
-        result = stream.result  # ActionResult
-    """
-
-    def __init__(self, gen: Iterator[ExecEvent | ExecDone], sandbox: "Sandbox", *,
-                 do_checkpoint: bool, do_changeset: bool,
-                 changeset_sync: bool, do_observe: bool) -> None:
-        self._gen = gen
-        self._sandbox = sandbox
-        self._do_checkpoint = do_checkpoint
-        self._do_changeset = do_changeset
-        self._changeset_sync = changeset_sync
-        self._do_observe = do_observe
-        self._result: ActionResult | None = None
-        self._returncode: int = -1
-        self._consumed = False
-
-    def __iter__(self) -> Iterator[ExecEvent | ExecDone]:
-        for event in self._gen:
-            if isinstance(event, ExecDone):
-                self._returncode = event.returncode
-            yield event
-        self._consumed = True
-        self._result = self._sandbox._build_action_result(
-            returncode=self._returncode,
-            stdout="",
-            stderr="",
-            args=(),
-            do_checkpoint=self._do_checkpoint,
-            do_changeset=self._do_changeset,
-            changeset_sync=self._changeset_sync,
-            do_observe=self._do_observe,
-        )
-
-    @property
-    def result(self) -> ActionResult:
-        """Available after iteration completes. Raises if accessed early."""
-        if self._result is None:
-            raise RuntimeError(
-                "ExecStream.result is only available after the stream is fully consumed"
-            )
-        return self._result
 
 
 @dataclass
@@ -232,19 +98,7 @@ class _CommandsNamespace:
         timeout: float | None = None,
         capture_output: bool = True,
         check: bool = False,
-        checkpoint: bool = False,
-        changeset: bool = False,
-        changeset_sync: bool = False,
-        observe: bool = False,
-    ) -> ActionResult:
-        """Execute a command and return an ActionResult.
-
-        Optional enrichments:
-          - ``checkpoint=True``: trigger an async checkpoint after exec
-          - ``changeset=True``: compute filesystem changeset after exec
-          - ``changeset_sync=True``: make changeset synchronous (returns list)
-          - ``observe=True``: peek inspector state (filesystem/process changed)
-        """
+    ) -> SandboxExecResult:
         if argv is None:
             if isinstance(cmd, list):
                 argv = cmd
@@ -268,118 +122,7 @@ class _CommandsNamespace:
                 f"sandbox command failed: rc={result.returncode} cmd={cmd!r} "
                 f"stderr={result.stderr!r}"
             )
-        # Resolve whether to checkpoint (per-call or sandbox-level auto)
-        do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
-        return self._sandbox._build_action_result(
-            returncode=result.returncode,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            args=result.args,
-            do_checkpoint=do_checkpoint,
-            do_changeset=changeset,
-            changeset_sync=changeset_sync,
-            do_observe=observe,
-        )
-
-    def stream(
-        self,
-        cmd: str | list[str] | None = None,
-        *,
-        argv: list[str] | None = None,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        user: str | None = None,
-        timeout: float | None = None,
-        checkpoint: bool = False,
-        changeset: bool = False,
-        changeset_sync: bool = False,
-        observe: bool = False,
-    ) -> ExecStream:
-        """Streaming exec that returns an ExecStream.
-
-        Iterate the stream to consume events; after iteration completes,
-        access ``stream.result`` for the ActionResult with checkpoint/
-        changeset/observer information.
-
-        Usage::
-
-            stream = sandbox.commands.stream("ls -la", checkpoint=True)
-            for event in stream:
-                if isinstance(event, ExecEvent):
-                    print(f"[{event.channel}] {event.text}", end="")
-            result = stream.result  # ActionResult
-        """
-        if argv is None:
-            if isinstance(cmd, list):
-                argv = cmd
-            elif isinstance(cmd, str):
-                argv = ["/bin/sh", "-c", cmd]
-            else:
-                raise TypeError("commands.stream requires either cmd or argv")
-        merged_env = self._sandbox._command_env(env)
-        runtime = self._sandbox._engine.runtime
-        gen = runtime.stream_exec(
-            self._sandbox.sandbox_id,
-            argv,
-            cwd=cwd,
-            env=merged_env,
-            user=user,
-            timeout_s=timeout,
-        )
-        do_checkpoint = checkpoint or bool(self._sandbox._auto_checkpoint)
-        return ExecStream(
-            gen, self._sandbox,
-            do_checkpoint=do_checkpoint,
-            do_changeset=changeset,
-            changeset_sync=changeset_sync,
-            do_observe=observe,
-        )
-
-
-class _PortsNamespace:
-    """`sbx.ports.*` — port exposure (S4).
-
-    Expose sandbox ports through the gateway's L4 proxy so external
-    clients can reach services running inside the sandbox.
-    """
-
-    def __init__(self, sandbox: "Sandbox") -> None:
-        self._sandbox = sandbox
-
-    def expose(self, port: int) -> PortAllocation:
-        """Expose a guest port; returns the allocation with host_port and url."""
-        client = self._sandbox._engine.runtime._client  # type: ignore[attr-defined]
-        result = client.post_json(
-            f"/sandboxes/{self._sandbox.sandbox_id}/ports",
-            {"port": int(port)},
-        )
-        return PortAllocation(
-            host_port=int(result["host_port"]),
-            guest_port=int(result["guest_port"]),
-            url=str(result["url"]),
-        )
-
-    def list(self) -> list[PortAllocation]:
-        """List all port allocations for this sandbox."""
-        client = self._sandbox._engine.runtime._client  # type: ignore[attr-defined]
-        result = client.get_json(
-            f"/sandboxes/{self._sandbox.sandbox_id}/ports",
-        )
-        return [
-            PortAllocation(
-                host_port=int(p["host_port"]),
-                guest_port=int(p["guest_port"]),
-                url=f"tcp://unknown:{p['host_port']}",
-            )
-            for p in result.get("ports") or []
-        ]
-
-    def release(self, port: int) -> None:
-        """Release a port allocation."""
-        client = self._sandbox._engine.runtime._client  # type: ignore[attr-defined]
-        client.delete(
-            f"/sandboxes/{self._sandbox.sandbox_id}/ports/{int(port)}",
-        )
+        return result
 
 
 class _FilesNamespace:
@@ -481,16 +224,13 @@ class Sandbox:
         engine: "Engine | None" = None,
         autostart: bool = True,
         network: bool | None = None,
-        # `resources` is enforced (S3): normalized at construction and
-        # applied as cgroup limits on the runc launch path. `timeout` and
-        # `labels` remain advisory metadata exposed via `Sandbox.metadata`.
+        # Forward-compatible kwargs (resources, timeout, labels) — stored as
+        # metadata for now and exposed via `Sandbox.metadata`.
         resources: dict[str, object] | None = None,
         timeout: float | None = None,
         labels: dict[str, str] | None = None,
-        auto_checkpoint: bool = False,
     ) -> None:
         from .engine import get_default_engine
-        from .resources import normalize_resources
 
         self._engine = engine if engine is not None else get_default_engine()
         self._lock = threading.Lock()
@@ -498,9 +238,6 @@ class Sandbox:
         self._sandbox_id: SandboxId | None = None
         self._launch_plan: _LaunchPlan | None = None
         self._user_env = dict(env or {})
-        # Loud at construction: an invalid resources shape must fail before
-        # any launch work happens (enforced limits, not advisory metadata).
-        self._resource_claim = normalize_resources(resources)
         self._metadata = {
             "resources": dict(resources or {}),
             "timeout": timeout,
@@ -520,12 +257,6 @@ class Sandbox:
         self._agent_ignore_process_rules: list[dict[str, object]] = []
         self._agent_ignored_path_prefixes: list[str] = []
         self._exposed_ports: dict[int, str] = {}
-        self._auto_checkpoint = bool(auto_checkpoint)
-        # Tracks the most recently started (pre-allocated) checkpoint id so
-        # callers using auto_checkpoint can retrieve it without wiring the
-        # AsyncCheckpoint handle through the ActionResult (which is still
-        # returned for explicit `checkpoint=True` callers).
-        self._last_checkpoint_id: str | None = None
         self._desired_name = name
         self._desired_image = image
         self._template = template
@@ -538,7 +269,6 @@ class Sandbox:
         self.commands = _CommandsNamespace(self)
         self.files = _FilesNamespace(self)
         self.checkpoints = _CheckpointsNamespace(self)
-        self.ports = _PortsNamespace(self)
 
         if autostart:
             self._launch()
@@ -561,17 +291,10 @@ class Sandbox:
         )
         self._launch_plan = plan
         self._sandbox_id = sandbox_id
-        if self._is_remote_runtime(runtime):
-            # S5 full-access: remote mode — daemon handles all bundle prep.
-            launch_metadata = self._build_remote_launch_metadata(plan, sandbox_id)
-        elif runtime_name == "runc":
+        if runtime_name == "runc":
             launch_metadata = self._prepare_runc_launch(plan, sandbox_id)
         else:
             launch_metadata = {"sandbox_id": str(sandbox_id), **dict(plan.metadata)}
-        if self._resource_claim:
-            # The normalized claim rides the launch metadata so the gateway
-            # (cloud mode) can meter per-tenant aggregate quotas (§4 S3).
-            launch_metadata = {**launch_metadata, "resources": dict(self._resource_claim)}
         sandbox_id = runtime.launch(runtime_name, launch_metadata)
         self._sandbox_id = sandbox_id
         self._mark_inspector_running()
@@ -582,26 +305,6 @@ class Sandbox:
             runtime_name,
             plan.image,
         )
-
-    @staticmethod
-    def _is_remote_runtime(runtime) -> bool:
-        """True when the runtime is a proxy to a remote daemon (cloud mode)."""
-        # Duck-type: RuntimeProxy has _client; local RuncRuntime does not.
-        return hasattr(runtime, "_client")
-
-    def _build_remote_launch_metadata(
-        self, plan: "_LaunchPlan", sandbox_id: SandboxId
-    ) -> dict[str, object]:
-        """Minimal metadata for daemon-side bundle prep (S5 full-access)."""
-        md: dict[str, object] = {
-            "sandbox_id": str(sandbox_id),
-            "image": plan.image,
-        }
-        if self._user_env:
-            md["env"] = dict(self._user_env)
-        if self._network_requested:
-            md["network"] = True
-        return md
 
     def _default_image(self) -> str | None:
         return self._engine.config.default_image
@@ -636,7 +339,6 @@ class Sandbox:
             sandbox_id,
             force=self._template is not None,
         )
-        resource_limits = self._bundle_resource_limits()
 
         if self._template is not None:
             sandbox_bundle.write_bundle_config(
@@ -650,7 +352,6 @@ class Sandbox:
                 network_namespace_path=network_namespace_path,
                 image_defaults=None,
                 image_rootfs_dir=None,
-                resource_limits=resource_limits,
             )
             template_data = self._template.configure_runc_bundle(
                 engine=self._engine,
@@ -709,17 +410,8 @@ class Sandbox:
             network_namespace_path=network_namespace_path,
             image_defaults=image_defaults,
             image_rootfs_dir=exported_rootfs,
-            resource_limits=resource_limits,
         )
         self._write_sdk_bundle_process(bundle_dir, image_defaults)
-        # TLS trust injection: add CA cert to rootfs copy paths.
-        rootfs_copy_paths = [{"source": str(exported_rootfs), "destination": "/"}]
-        ca_cert_path = getattr(self._engine, "tls_ca_cert_path", None)
-        if ca_cert_path is not None:
-            from .tls_trust import _SANDBOX_CA_CERT_PATH  # no cryptography dep
-            rootfs_copy_paths.append(
-                {"source": str(ca_cert_path), "destination": _SANDBOX_CA_CERT_PATH}
-            )
         plan.bundle_dir = bundle_dir
         plan.image = image_tag
         plan.work_dir_host = work_dir_host_path
@@ -734,8 +426,8 @@ class Sandbox:
                 "bundle_path": str(bundle_dir),
                 "work_dir_host_path": None if work_dir_host_path is None else str(work_dir_host_path),
                 "rootfs_init_dirs": self._rootfs_init_dirs(),
-                "rootfs_copy_paths": rootfs_copy_paths,
-                "shared_rootfs_key": self._shared_rootfs_key(image_id, ca_cert_path),
+                "rootfs_copy_paths": [{"source": str(exported_rootfs), "destination": "/"}],
+                "shared_rootfs_key": image_id[:32],
                 "shared_rootfs_persist": True,
                 "sdk_image": image_tag,
                 "sdk_process_cwd": plan.process_cwd,
@@ -744,38 +436,6 @@ class Sandbox:
             }
         )
         return dict(plan.metadata)
-
-    def _bundle_resource_limits(self) -> "object | None":
-        """Normalized claim -> `SandboxResourceLimits` for the bundle spec
-        (`linux.resources`); None when no limits were requested so the
-        written spec is identical to the unlimited one."""
-        if not self._resource_claim:
-            return None
-        from integrations.sandboxes.runtime import bundle as sandbox_bundle
-
-        return sandbox_bundle.SandboxResourceLimits(
-            cpus=self._resource_claim.get("cpus"),
-            memory_bytes=self._resource_claim.get("memory_bytes"),
-            pids_limit=self._resource_claim.get("pids"),
-        )
-
-    @staticmethod
-    def _shared_rootfs_key(image_id: str, ca_cert_path: Path | None) -> str:
-        """Compute cache key for the shared-rootfs ZFS snapshot.
-
-        The key incorporates the image identity *and* the TLS CA state so that
-        toggling interception (or rotating the CA) invalidates stale snapshots
-        that lack the injected certificate.
-        """
-        base = image_id[:32]
-        if ca_cert_path is None:
-            return base
-        try:
-            ca_digest = hashlib.sha256(ca_cert_path.read_bytes()).hexdigest()[:16]
-        except OSError:
-            # CA path configured but file missing/unreadable — treat as no-CA.
-            return base
-        return f"{base}-ca{ca_digest}"
 
     def _resolve_work_dir_host_path(self, sandbox_id: SandboxId, *, force: bool = False) -> Path | None:
         if self._work_dir_host is not None:
@@ -794,16 +454,13 @@ class Sandbox:
     def _requires_network_namespace(self) -> bool:
         if self._network_requested is not None:
             return bool(self._network_requested)
-        config = self._engine.config
-        if self._engine.runtime.name != "runc" or not config.enable_sandbox_network:
-            return False
-        # The bridge netns is what makes both features possible: request
-        # attribution for the interceptor, and the REDIRECT hook point for
-        # egress interception (D1) — without it the sandbox shares the
-        # host's network and its egress bypasses the proxy entirely.
-        return bool(
-            config.enable_interceptor or getattr(config, "enable_egress_proxy", False)
-        )
+        if (
+            self._engine.runtime.name == "runc"
+            and self._engine.config.enable_sandbox_network
+            and self._engine.config.enable_interceptor
+        ):
+            return True
+        return False
 
     def _network_launch_metadata(self, lease) -> dict[str, object]:
         if lease is None:
@@ -995,7 +652,6 @@ class Sandbox:
                 "PYTHONUNBUFFERED=1",
                 f"CRAB_SANDBOX_ID={self.sandbox_id}",
                 *[f"{key}={value}" for key, value in self._user_env.items()],
-                *self._tls_ca_env_assignments(),
             ],
         )
         process["env"] = env
@@ -1104,137 +760,6 @@ class Sandbox:
         return self._network_lease is not None
 
     # ------------------------------------------------------------------
-    # Action result builder (checkpoint / changeset / observe)
-    # ------------------------------------------------------------------
-
-    def _build_action_result(
-        self,
-        *,
-        returncode: int,
-        stdout: str,
-        stderr: str,
-        args: tuple[str, ...],
-        do_checkpoint: bool,
-        do_changeset: bool,
-        changeset_sync: bool,
-        do_observe: bool,
-    ) -> ActionResult:
-        """Construct an ActionResult with optional async enrichments."""
-        ckpt_handle: AsyncCheckpoint | None = None
-        cs_handle: AsyncChangeset | list[dict] | None = None
-        fs_changed: bool | None = None
-        proc_changed: bool | None = None
-
-        # Snapshot the checkpoint id that existed *before* this action.
-        # Changeset semantics: "what changed since the last checkpoint",
-        # so we must diff against the previous id, not the fresh one that
-        # the concurrent checkpoint (if any) is about to create.
-        prev_ckpt_id = self._last_checkpoint_id
-
-        # Observe BEFORE starting the async checkpoint. When a checkpoint
-        # finishes, `mark_checkpoint_complete` resets the inspector's
-        # `filesystem_changed`/`process_changed` cursors (scorched-earth
-        # wipe in host-inspector `reset()`). If we peeked after starting
-        # the checkpoint, the reset could race with — and win against —
-        # the peek, so `observe=True` would report False for actions
-        # that clearly mutated state. Peeking first also matches the
-        # semantic contract in the tutorial: observe answers "did *this
-        # action* mutate?", relative to state before the concurrent
-        # checkpoint snapshots it.
-        if do_observe:
-            fs_changed, proc_changed = self._peek_inspector()
-
-        if do_checkpoint:
-            ckpt_handle = self._start_async_checkpoint()
-
-        if do_changeset:
-            if changeset_sync:
-                cs_handle = self._run_changeset_sync(since=prev_ckpt_id)
-            else:
-                cs_handle = self._start_async_changeset(since=prev_ckpt_id)
-
-        return ActionResult(
-            returncode=returncode,
-            stdout=stdout,
-            stderr=stderr,
-            args=args,
-            checkpoint=ckpt_handle,
-            changeset=cs_handle,
-            filesystem_changed=fs_changed,
-            process_changed=proc_changed,
-        )
-
-    @property
-    def last_checkpoint_id(self) -> str | None:
-        """Most recently pre-allocated checkpoint id (auto_checkpoint /
-        explicit ``checkpoint=True``). ``None`` before the first checkpoint.
-        Available immediately after ``commands.run`` returns — the actual
-        checkpoint may still be running in the background."""
-        return self._last_checkpoint_id
-
-    def _start_async_checkpoint(self) -> AsyncCheckpoint:
-        """Pre-allocate a checkpoint_id and run the checkpoint in background."""
-        ckpt_id = f"ckpt-{uuid.uuid4().hex[:12]}"
-        self._last_checkpoint_id = ckpt_id
-        handle = AsyncCheckpoint(ckpt_id, threading.Thread(target=lambda: None))
-
-        def _do_checkpoint() -> None:
-            try:
-                self.checkpoint(checkpoint_id=ckpt_id)
-            except BaseException as exc:
-                handle._error = exc
-
-        t = threading.Thread(target=_do_checkpoint, daemon=True, name="crab-async-ckpt")
-        handle._thread = t
-        t.start()
-        return handle
-
-    def _start_async_changeset(self, *, since: str | None = None) -> AsyncChangeset:
-        """Run ``changeset(since=..., force=True)`` in background.
-
-        ``since`` should be the checkpoint id the caller wants to diff
-        against — typically the previous ``last_checkpoint_id``. When
-        ``None``, the call falls back to ``fork_changeset``, which only
-        works for sandboxes produced by ``fork_once`` (see
-        :meth:`changeset`)."""
-        handle = AsyncChangeset(threading.Thread(target=lambda: None))
-
-        def _do_changeset() -> None:
-            try:
-                handle._result = self.changeset(since=since, force=True)
-            except BaseException as exc:
-                handle._error = exc
-
-        t = threading.Thread(target=_do_changeset, daemon=True, name="crab-async-cs")
-        handle._thread = t
-        t.start()
-        return handle
-
-    def _run_changeset_sync(self, *, since: str | None = None) -> list[dict]:
-        """Run ``changeset(since=..., force=True)`` synchronously."""
-        return self.changeset(since=since, force=True)
-
-    def _peek_inspector(self) -> tuple[bool | None, bool | None]:
-        """Read-only peek at inspector state (no reset).
-
-        Returns ``(None, None)`` if the peek fails; the reason is logged
-        at WARNING so tutorials / CLI users can see why ``observe=True``
-        did not surface real flags (e.g. daemon snapshot not registered,
-        gateway 404, connection error)."""
-        try:
-            system = self._engine.system
-            snapshot = system.inspector.inspect(self.sandbox_id)
-            return (bool(snapshot.filesystem_changed), bool(snapshot.process_changed))
-        except Exception as exc:
-            logger.warning(
-                "inspector peek failed for sandbox=%s: %s",
-                self._sandbox_id,
-                exc,
-            )
-            logger.debug("inspector peek traceback", exc_info=True)
-            return (None, None)
-
-    # ------------------------------------------------------------------
     # Lifecycle ops
     # ------------------------------------------------------------------
 
@@ -1251,24 +776,6 @@ class Sandbox:
         self._closed = True
         if sandbox_id is None:
             return
-        try:
-            # Fork bookkeeping: if this sandbox has live forks, replace
-            # chain-shared symlinks with real bytes first; if it *is* a
-            # fork, release its chain pin. Remote engines expose a system
-            # shim without these hooks — degrade gracefully.
-            system = getattr(self._engine, "system", None)
-            if system is not None:
-                release_txn = getattr(system, "release_txn", None)
-                if callable(release_txn):
-                    release_txn(sandbox_id)
-                prepare = getattr(system, "prepare_source_destroy", None)
-                if callable(prepare):
-                    prepare(sandbox_id)
-                release = getattr(system, "release_fork", None)
-                if callable(release):
-                    release(sandbox_id)
-        except Exception:
-            logger.exception("Fork bookkeeping failed during kill: id=%s", sandbox_id)
         try:
             self._engine.runtime.delete(sandbox_id)
         except Exception:
@@ -1288,11 +795,10 @@ class Sandbox:
     # Checkpoint / restore / fork
     # ------------------------------------------------------------------
 
-    def checkpoint(self, label: str | None = None, *, leave_running: bool = True, checkpoint_id: str | None = None) -> str:
+    def checkpoint(self, label: str | None = None, *, leave_running: bool = True) -> str:
         result = self._engine.system.checkpoint_once(
             self.sandbox_id,
             leave_running=leave_running,
-            checkpoint_id=checkpoint_id,
         )
         if result.manifest is None:
             raise RuntimeError(f"checkpoint failed: status={result.status.value} message={result.message}")
@@ -1312,337 +818,25 @@ class Sandbox:
         self._engine.repair_network_lease(self.sandbox_id)
         self._mark_inspector_running()
 
-    def fork(
-        self, count: int = 1, *, lazy: bool = False, effects: str | None = None
-    ) -> list["Sandbox"]:
-        """Clone this sandbox via checkpoint+restore. Each fork is an
-        independent, running sandbox sharing initial state with the parent
-        (fresh checkpoint at call time; incremental chain sharing applies
-        when the runtime supports it).
+    def fork(self, count: int = 1) -> list["Sandbox"]:
+        """Clone this sandbox via checkpoint+restore (CRIU+ZFS). Each fork is
+        an independent sandbox sharing initial state with the parent.
 
-        With ``lazy=True`` the process restore uses CRIU lazy-pages: the
-        call returns as soon as metadata and the eager page set are in
-        place, and memory streams in on demand.
-
-        ``effects`` declares what the fork is *for*, which is what decides
-        whether its outbound writes are gated (F1):
-
-        - omitted (default) — an **independent branch**: an RL rollout or a
-          tree-search arm is a first-class timeline whose external effects
-          are intended, so N forks legitimately produce N effects and
-          nothing is gated. Unchanged from before.
-        - ``"reject"`` — a **temporal branch**: a speculative fork that
-          serves this sandbox and must not write on its own. Mutating
-          plaintext egress is refused at the proxy with ``503`` and shows up
-          in the fork's effect ledger; if the guess pays off, the promoted
-          identity issues the write once.
-        - ``"allow"`` — explicit opt-out, same as omitting it unless the
-          deployment flipped ``effects.standalone_fork_policy``.
-
-        ``"defer"`` and ``"seal"`` raise ``ValueError``: a bare fork has no
-        commit to flush a queue into and no abort for a seal to block.
-
-        **Bounded by TLS**: ``effects="reject"`` prevents *plaintext*
-        mutating egress. HTTPS writes stay unclassifiable and are not
-        blocked, so a speculative fork writing over HTTPS can still
-        double-fire.
-
-        Note: forks share the parent's ``work_dir`` host mount (fork shares
-        initial state by design); pass a fresh work dir to a new sandbox if
-        isolation is needed.
+        First-cut implementation: takes a fresh checkpoint, then for each
+        fork the engine spins up a new sandbox and restores from the
+        checkpoint. Operators may want to wire incremental forks (today's
+        chain-sharing) later — the SDK shape is forward-compatible.
         """
         if count < 1:
             raise ValueError("fork count must be >= 1")
-        fork_ids = self._engine.fork_sandbox(
-            self.sandbox_id, count=count, lazy=lazy, effects=effects
+        # For first cut, mark fork as unsupported via a clear error. The
+        # underlying machinery exists in the harness but its integration
+        # with the bare SDK launch path needs follow-up.
+        raise NotImplementedError(
+            "Sandbox.fork() will be wired in a follow-up PR. The harness's "
+            "clone_checkpoint_to_fork machinery exists today; the SDK shape "
+            "is locked so call sites can adopt it now."
         )
-        forks: list[Sandbox] = []
-        for fork_id in fork_ids:
-            fork = Sandbox.connect(fork_id, engine=self._engine)
-            fork._mark_inspector_running()
-            forks.append(fork)
-        return forks
-
-    def actions(self, *, kind: str | None = None, limit: int | None = None) -> list[dict]:
-        """Read this sandbox's action journal: every exec attempt (argv,
-        cwd, env, exit status, timing) plus lifecycle markers
-        (launch/checkpoint/restore/fork/destroy) and adopted fork history
-        (kind="observation", C3), oldest first.
-
-        Works with both a local in-process engine and the daemon
-        (`crab sandbox actions` from the CLI).
-        """
-        system = getattr(self._engine, "system", None)
-        journal = getattr(system, "journal", None)
-        if journal is None:
-            raise NotImplementedError(
-                "action journal is not available on this engine"
-            )
-        records = journal.entries(self.sandbox_id, kind=kind)
-        if limit is not None and limit >= 0:
-            records = records[-limit:]
-        return [record.to_json() for record in records]
-
-    def changeset(self, since: str | CheckpointId | None = None, *, force: bool = False) -> list[dict]:
-        """Changed rootfs paths (added/modified/removed/renamed) relative
-        to a base checkpoint's filesystem snapshot. ``since=None``
-        resolves this sandbox's fork point (``fork_created`` journal
-        marker); pass a checkpoint id for an explicit base.
-
-        ``force=True`` skips the inspector gate optimization so the
-        backend diff always runs.
-
-        Works with both a local in-process engine and the daemon
-        (`crab sandbox changeset` from the CLI).
-        """
-        system = getattr(self._engine, "system", None)
-        if since is None:
-            fork_changeset = getattr(system, "fork_changeset", None)
-            if not callable(fork_changeset):
-                raise NotImplementedError(
-                    "changesets are not available on this engine"
-                )
-            result = fork_changeset(self.sandbox_id, force=force)
-        else:
-            changeset_since = getattr(system, "changeset_since", None)
-            if not callable(changeset_since):
-                raise NotImplementedError(
-                    "changesets are not available on this engine"
-                )
-            result = changeset_since(
-                self.sandbox_id,
-                CheckpointId(str(since)),
-                use_inspector_gate=not force,
-            )
-        return [entry.to_json() for entry in result.entries]
-
-    def merge(
-        self,
-        fork: "Sandbox | str",
-        *,
-        policy: str = "fail_fast",
-        ignore_prefixes: tuple[str, ...] | None = None,
-        merger=None,
-        observations: str = "none",
-        observation_summarizer=None,
-    ) -> MergeReport:
-        """Three-way merge of a fork's filesystem changes back into this
-        sandbox (C2): each fork-changed path applies iff this sandbox
-        did not change it since the fork point; conflicts resolve per
-        ``policy`` — ``fail_fast`` (default: any conflict aborts before
-        a single write), ``prefer_fork``, ``prefer_source``, or
-        ``text_merge`` (in-repo line-based diff3; unresolved overlap
-        aborts like fail_fast). A ``merger`` callable
-        ``(path, base, source, fork) -> bytes | None`` gets first shot
-        at every conflict. Returns a ``MergeReport``; apply failures
-        raise ``MergeError`` carrying the report (``rolled_back=True``
-        after a clean path-level undo). The fork stays alive.
-
-        Works with both a local in-process engine and the daemon
-        (`crab sandbox merge` from the CLI); custom ``merger`` hooks are
-        local-only and cannot cross the RPC boundary.
-        """
-        system = getattr(self._engine, "system", None)
-        merge_from_fork = getattr(system, "merge_from_fork", None)
-        if not callable(merge_from_fork):
-            raise NotImplementedError(
-                "merge is not available on this engine"
-            )
-        fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
-        kwargs = {}
-        if observations != "none":
-            kwargs["observations"] = observations
-        if observation_summarizer is not None:
-            kwargs["observation_summarizer"] = observation_summarizer
-        return merge_from_fork(
-            self.sandbox_id,
-            fork_id,
-            policy=policy,
-            ignore_prefixes=ignore_prefixes,
-            merger=merger,
-            **kwargs,
-        )
-
-    def consolidate_observations(
-        self,
-        fork: "Sandbox | str",
-        *,
-        policy: str = "append",
-        summarizer=None,
-    ) -> ObservationReport:
-        """Adopt a fork's journal history into this sandbox's journal
-        (C3): ``append`` copies every qualifying record with provenance,
-        ``dedupe`` skips execs this sandbox produced identically itself
-        since the fork point, ``none`` copies nothing (combine with
-        ``summarizer`` for a digest-only entry). Read the result back
-        via ``actions(kind="observation")``.
-
-        Works with both a local in-process engine and the daemon
-        (`crab sandbox consolidate` from the CLI); ``summarizer``
-        callables are local-only.
-        """
-        system = getattr(self._engine, "system", None)
-        consolidate = getattr(system, "consolidate_observations", None)
-        if not callable(consolidate):
-            raise NotImplementedError(
-                "observation consolidation is not available on this engine"
-            )
-        fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
-        return consolidate(
-            self.sandbox_id,
-            fork_id,
-            policy=policy,
-            summarizer=summarizer,
-        )
-
-    def egress(self, *, txn_id: str | None = None, since_seq: int | None = None) -> EgressLedger:
-        """Effect ledger (D1): every outbound flow this sandbox opened,
-        classified as ``idempotent_read`` / ``mutating`` / ``opaque``
-        (encrypted and raw flows are opaque — the proxy sees the host,
-        not the method). Pass ``txn_id`` to scope the view to one
-        transaction. Requires ``EngineConfig(enable_egress_proxy=True)``
-        for flows to exist; works locally and against the daemon
-        (`crab sandbox egress`).
-        """
-        system = getattr(self._engine, "system", None)
-        egress_ledger = getattr(system, "egress_ledger", None)
-        if not callable(egress_ledger):
-            raise NotImplementedError("the effect ledger is not available on this engine")
-        return egress_ledger(self.sandbox_id, txn_id=txn_id, since_seq=since_seq)
-
-    def replay_egress(
-        self,
-        *,
-        policy: str = "cassette_first",
-        cassette_source: "Sandbox | str | None" = None,
-    ):
-        """Context manager serving this sandbox's recorded reads from
-        cassettes instead of the network (D2). ``cassette_source`` reads
-        another sandbox's bucket — pass the fork whose reads you are
-        re-running. ``policy="cassette_only"`` turns a miss into a 504
-        instead of live traffic. Writes and encrypted flows always pass
-        through. Yields nothing; the report is returned on exit via
-        ``.report``.
-        """
-        system = getattr(self._engine, "system", None)
-        begin = getattr(system, "begin_egress_replay", None)
-        end = getattr(system, "end_egress_replay", None)
-        if not callable(begin) or not callable(end):
-            raise NotImplementedError("egress replay is not available on this engine")
-        source = (
-            cassette_source.sandbox_id
-            if isinstance(cassette_source, Sandbox)
-            else cassette_source
-        )
-
-        class _ReplayWindow:
-            report = None
-
-        @contextlib.contextmanager
-        def _window():
-            handle = _ReplayWindow()
-            begin(self.sandbox_id, policy=policy, cassette_source=source)
-            try:
-                yield handle
-            finally:
-                handle.report = end(self.sandbox_id)
-
-        return _window()
-
-    def merge_processes(
-        self,
-        fork: "Sandbox | str",
-        *,
-        strategy: str = "auto",
-        policy: str = "fail_fast",
-        observations: str = "append",
-        stop_on_deviation: bool = False,
-        lazy_pages: bool = True,
-        force: bool = False,
-        egress_replay: str = "cassette_first",
-        replay_effects: str = "reject",
-    ) -> "ProcessMergeReport":
-        """Process-half of consolidation (C4). ``strategy="auto"``
-        resolves from a process census on this sandbox: with live
-        background processes the fork's journaled execs are **replayed**
-        here verbatim (deviations against the recorded outcomes are
-        counted; ``stop_on_deviation`` aborts at the first one); without
-        any, the fork is **promoted** wholesale onto this sandbox's
-        identity (PR-C4.2 — ``policy``/``observations``/``lazy_pages``/
-        ``force`` steer that path). Returns a ProcessMergeReport.
-
-        Works with both a local in-process engine and the daemon
-        (`crab sandbox merge-processes` from the CLI).
-        """
-        system = getattr(self._engine, "system", None)
-        merge_processes = getattr(system, "merge_processes", None)
-        if not callable(merge_processes):
-            raise NotImplementedError(
-                "process merge is not available on this engine"
-            )
-        fork_id = fork.sandbox_id if isinstance(fork, Sandbox) else SandboxId(str(fork))
-        return merge_processes(
-            self.sandbox_id,
-            fork_id,
-            strategy=strategy,
-            policy=policy,
-            observations=observations,
-            stop_on_deviation=stop_on_deviation,
-            lazy_pages=lazy_pages,
-            force=force,
-            egress_replay=egress_replay,
-            replay_effects=replay_effects,
-        )
-
-    def begin(
-        self,
-        label: str | None = None,
-        *,
-        isolation: str = "snapshot",
-        effects: str | None = None,
-    ) -> "Transaction":
-        """Open a transaction. ``isolation="snapshot"`` (default, B2):
-        adaptive base checkpoint + observation staging armed +
-        auto-checkpoints suppressed; actions run in place (weak
-        isolation), commit delivers staged observations, abort restores
-        the base. ``isolation="fork"`` (B3): begin forks the sandbox and
-        ``txn.exec`` runs in the fork while this sandbox stays clean and
-        serving; commit promotes the fork's whole state (filesystem +
-        processes) back onto this sandbox's identity, abort just
-        destroys the fork.
-
-        Works with both a local in-process engine and the daemon
-        (`crab txn ...` from the CLI).
-        """
-        from .txn import Transaction
-
-        system = getattr(self._engine, "system", None)
-        begin_txn = getattr(system, "begin_txn", None)
-        if not callable(begin_txn):
-            raise NotImplementedError(
-                "transactions are not available on this engine "
-                "(daemon-mode txn RPC lands in a follow-up)"
-            )
-        kwargs = {} if isolation == "snapshot" else {"isolation": isolation}
-        # Only pass the policy when the caller chose one, so older system
-        # fakes (and pre-D3 daemons) keep working with their defaults.
-        if effects is not None:
-            kwargs["effects"] = effects
-        description = begin_txn(self.sandbox_id, label=label, **kwargs)
-        return Transaction(self, description)
-
-    def current_txn(self) -> "Transaction | None":
-        """Reattach to this sandbox's active transaction, if any."""
-        from .txn import Transaction
-
-        system = getattr(self._engine, "system", None)
-        current = getattr(system, "current_txn", None)
-        if not callable(current):
-            return None
-        description = current(self.sandbox_id)
-        if description is None:
-            return None
-        return Transaction(self, description)
 
     # ------------------------------------------------------------------
     # Network
@@ -1678,11 +872,6 @@ class Sandbox:
         Agent-specific LLM env is supplied by `Agent.command_env(...)`.
         """
         merged: dict[str, str] = {}
-        # TLS CA env injection (exec path) — before user env so user can
-        # override if needed.
-        ca_env = self._tls_ca_env_dict()
-        if ca_env:
-            merged.update(ca_env)
         if self._user_env:
             merged.update(self._user_env)
         if overrides:
@@ -1700,32 +889,5 @@ class Sandbox:
             return Path(rootfs)
         raise RuntimeError("runtime does not expose a host rootfs path")
 
-    # ------------------------------------------------------------------
-    # TLS trust injection (§3.3)
-    # ------------------------------------------------------------------
 
-    def _tls_ca_env_dict(self) -> dict[str, str] | None:
-        """Return CA env overlay dict when TLS interception is active, else None."""
-        ca_path = getattr(self._engine, "tls_ca_cert_path", None)
-        if ca_path is None:
-            return None
-        from .tls_trust import tls_ca_env_overlay  # no cryptography dep
-        return tls_ca_env_overlay()
-
-    def _tls_ca_env_assignments(self) -> list[str]:
-        """Return CA env as KEY=VALUE assignment strings for init env."""
-        overlay = self._tls_ca_env_dict()
-        if not overlay:
-            return []
-        return [f"{k}={v}" for k, v in overlay.items()]
-
-    def _inject_tls_ca_into_rootfs(self, rootfs_path: Path) -> None:
-        """Copy the CA cert into the sandbox rootfs when interception is on."""
-        ca_path = getattr(self._engine, "tls_ca_cert_path", None)
-        if ca_path is None:
-            return
-        from .tls_trust import inject_ca_into_rootfs  # no cryptography dep
-        inject_ca_into_rootfs(rootfs_path, ca_path)
-
-
-__all__ = ["Sandbox", "ActionResult", "AsyncCheckpoint", "AsyncChangeset", "ExecStream"]
+__all__ = ["Sandbox"]

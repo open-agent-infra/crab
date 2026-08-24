@@ -15,22 +15,6 @@ max_workers: 2
 # this prefix when --zpool is supplied.
 zfs_dataset_prefix: crab/sandboxes
 
-# Alternative CoW backend: btrfs subvolumes instead of ZFS datasets.
-# Prepare the mount with `install-ubuntu.sh --fs-backend btrfs` (or mount a
-# btrfs filesystem manually), then switch the two lines below on. Per-snapshot
-# byte stats need qgroups and are off by default (btrfs_qgroups_enabled).
-# filesystem_backend: btrfs
-# btrfs_root: /var/lib/crab/btrfs
-
-# Third backend: overlayfs rootfs (lowerdir = shared image content,
-# upperdir/workdir = per-sandbox btrfs subvolumes). Needs the same btrfs
-# mount (`install-ubuntu.sh --fs-backend overlay` prepares it); the overlay
-# area defaults to `<btrfs_root>/overlay` (override with overlay_root).
-# Not for docker-in-sandbox workloads: the kernel rejects nested overlay
-# uppers — keep those on zfs/btrfs. qgroups stats cover the upper only.
-# filesystem_backend: overlay
-# btrfs_root: /var/lib/crab/btrfs
-
 storage_planes:
   runtime_root: /var/lib/crab/runtime
   storage_root: /var/lib/crab/checkpoints

@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from crab import (
     AdapterFileSystemCWorker,
@@ -52,8 +52,8 @@ class FakeCommandRunner(CommandRunner):
     def __init__(self) -> None:
         self.commands: list[tuple[str, ...]] = []
 
-    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
-        _ = cwd, timeout_seconds
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        _ = cwd
         self.commands.append(tuple(command))
         return type(
             "Result",
@@ -67,8 +67,8 @@ class MappingCommandRunner(CommandRunner):
         self.responses = responses or {}
         self.commands: list[tuple[str, ...]] = []
 
-    def run(self, command: list[str], *, cwd: Path | None = None, timeout_seconds: float | None = None):
-        _ = cwd, timeout_seconds
+    def run(self, command: list[str], *, cwd: Path | None = None):
+        _ = cwd
         key = tuple(command)
         self.commands.append(key)
         returncode, stdout, stderr = self.responses.get(key, (0, "", ""))
@@ -1133,38 +1133,6 @@ class ContractTests(unittest.TestCase):
             self.assertIn("--leave-running=true", runner.commands[0])
             self.assertEqual(runner.commands[1], ("zfs", "snapshot", "pool/crab/sbx-1@ckpt-1"))
 
-    def test_runc_runtime_records_fs_ref_and_destroys_by_ref(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="crab_runc_runtime_fsref_") as tmp:
-            runner = FakeCommandRunner()
-            base = Path(tmp)
-            adapter = RuncRuntimeAdapter(
-                command_runner=runner,
-                paths=RuncRuntimePaths(
-                    state_root=base / "state",
-                    bundle_root=base / "bundles",
-                    checkpoint_root=base / "checkpoints",
-                    zfs_dataset_prefix="pool/crab",
-                ),
-            )
-
-            metadata = adapter.filesystem_checkpoint_metadata(SandboxId("sbx-1"), CheckpointId("ckpt-1"))
-            # Backend-neutral ref recorded alongside the legacy `snapshot`
-            # key (dual-write for one release).
-            self.assertEqual(metadata["fs_ref"], "zfs:pool/crab/sbx-1@ckpt-1")
-            self.assertEqual(metadata["snapshot"], "pool/crab/sbx-1@ckpt-1")
-
-            # Prefixed ref (new payloads) and bare snapshot name (legacy
-            # payloads) both destroy the same snapshot.
-            adapter.destroy_filesystem_ref("zfs:pool/crab/sbx-1@ckpt-1")
-            adapter.destroy_filesystem_ref("pool/crab/sbx-1@ckpt-2")
-            self.assertEqual(
-                runner.commands,
-                [
-                    ("zfs", "destroy", "pool/crab/sbx-1@ckpt-1"),
-                    ("zfs", "destroy", "pool/crab/sbx-1@ckpt-2"),
-                ],
-            )
-
     def test_runc_runtime_checkpoint_reports_process_size_and_snapshot_stats(self) -> None:
         with tempfile.TemporaryDirectory(prefix="crab_runc_runtime_stats_") as tmp:
             base = Path(tmp)
@@ -1214,13 +1182,13 @@ class ContractTests(unittest.TestCase):
                 ),
             )
 
-            # exec() moved from subprocess.run to subprocess.Popen so the
-            # runtime can track (and spot-kill) in-flight `runc exec`
-            # processes; fake the Popen handle accordingly.
-            fake_proc = MagicMock()
-            fake_proc.communicate.return_value = ("ok\n", "")
-            fake_proc.returncode = 0
-            with patch("crab.runtime.runc.subprocess.Popen", return_value=fake_proc):
+            completed = subprocess.CompletedProcess(
+                args=["runc", "exec"],
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+            with patch("crab.runtime.runc.subprocess.run", return_value=completed):
                 result = adapter.exec(
                     SandboxId("sbx-1"),
                     ["/bin/true"],

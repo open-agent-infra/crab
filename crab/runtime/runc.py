@@ -4,7 +4,7 @@ import fcntl
 import json
 import logging
 import os
-import selectors
+import re
 import shutil
 import subprocess
 import time
@@ -12,18 +12,13 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
-from typing import Iterator
 
-from ..contracts import ActionRecorder, Runtime, TelemetrySink
+from ..contracts import Runtime, TelemetrySink
 from ..ids import CheckpointId, SandboxId
-from ..models import ChangesetEntry, RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState, utc_now
+from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from ..remote_inspector import HostInspectorServiceClient
 from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_command_output, telemetry_is_detailed
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
-from .btrfs_provider import BtrfsProvider
-from .fs_provider import FilesystemProvider
-from .overlay_provider import OverlayProvider
-from .zfs_provider import ZfsProvider
 
 logger = logging.getLogger(__name__)
 _HOST_INSPECTOR_REGISTER_ATTEMPTS = 3
@@ -48,6 +43,9 @@ _RUNTIME_DEFAULT_IGNORE_PROCESS_RULES: tuple[dict[str, object], ...] = (
 _RESILIENT_EXEC_RECOVERY_TIMEOUT_S = 300.0
 _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS = 60.0
 _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS = 300.0
+_DATASET_DESTROY_BUSY_RETRIES = 10
+_DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
+_DATASET_PROMOTE_CONFLICT_RETRIES = 8
 _LAUNCH_PREPARED_METADATA_KEY = "_crab_runtime_prepared"
 _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY = "_crab_runtime_reuse_existing_rootfs"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
@@ -76,6 +74,7 @@ _POSTFIX_POSTDROP_DIRS = {
     "maildrop": 0o1730,
     "public": 0o2710,
 }
+_PROMOTE_CONFLICTING_SNAPSHOT_RE = re.compile(r"conflicting snapshot '([^']+)'")
 
 
 def _lookup_unix_id(path: Path, name: str, *, field_index: int) -> int | None:
@@ -160,15 +159,6 @@ class RuncRuntimePaths:
     checkpoint_root: Path = Path("/var/lib/crab/checkpoints")
     metadata_root: Path = Path("/var/lib/crab/sandbox-metadata")
     zfs_dataset_prefix: str = "crab/sandboxes"
-    # Root of the btrfs filesystem holding sandbox subvolumes. Only
-    # consulted when RuncRuntimeOptions.filesystem_backend == "btrfs".
-    btrfs_root: Path = Path("/var/lib/crab/btrfs")
-    # Root of the overlay backend's btrfs area (per-sandbox upper/work
-    # subvolumes, shared lowers, snapshot mounts). Only consulted when
-    # filesystem_backend == "overlay"; defaults to `<btrfs_root>/overlay`
-    # so a host prepared for the btrfs backend runs overlay with zero
-    # extra setup and the two backends' namespaces never collide.
-    overlay_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -214,14 +204,6 @@ class RuncRuntimeOptions:
     restore: RuncRestoreOptions = field(default_factory=RuncRestoreOptions)
     command_timeout_seconds: float = _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS
     zfs_prepare_timeout_seconds: float = _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS
-    # CoW backend for sandbox rootfs checkpoints: "zfs" (default),
-    # "btrfs", or "overlay" (overlayfs rootfs with upper/work on btrfs).
-    # Ignored when an explicit fs_provider is injected.
-    filesystem_backend: str = "zfs"
-    # Per-snapshot byte stats on btrfs/overlay require qgroups, which
-    # carry real overhead; default off (stats degrade to unknown). On
-    # overlay the stats cover the upper subvolume only.
-    btrfs_qgroups_enabled: bool = False
 
 
 class RuncRuntime(Runtime):
@@ -238,63 +220,18 @@ class RuncRuntime(Runtime):
         checkpoint_options: RuncCheckpointOptions | None = None,
         restore_options: RuncRestoreOptions | None = None,
         options: RuncRuntimeOptions | None = None,
-        fs_provider: FilesystemProvider | None = None,
-        action_recorder: ActionRecorder | None = None,
     ) -> None:
         self._version = version
         resolved_options = options or RuncRuntimeOptions()
         self._paths = paths or RuncRuntimePaths()
         self._runner = command_runner or SubprocessCommandRunner(timeout_seconds=resolved_options.command_timeout_seconds)
         self._runtime_bin = runtime_bin
+        self._zfs_bin = zfs_bin
         self._host_inspector_client = host_inspector_client
         self._telemetry = telemetry or NoopTelemetrySink()
-        # Action journal sink (roadmap B1). Optional; recording failures are
-        # swallowed so journaling never breaks exec/launch.
-        self.action_recorder = action_recorder
         self._checkpoint_options = checkpoint_options or resolved_options.checkpoint
         self._restore_options = restore_options or resolved_options.restore
         self._zfs_prepare_timeout_seconds = float(resolved_options.zfs_prepare_timeout_seconds)
-        # Filesystem CoW backend. Provider commands run through this
-        # runtime's _run_command/_run_status so telemetry stays identical;
-        # dataset naming that depends on per-sandbox descriptions resolves
-        # back through dataset_name_for/rootfs_path_for.
-        if fs_provider is not None:
-            self._fs = fs_provider
-        elif resolved_options.filesystem_backend == "btrfs":
-            self._fs = BtrfsProvider(
-                btrfs_root=self._paths.btrfs_root,
-                runtime_name=self.name,
-                run_command=self._run_command,
-                run_status=self._run_status,
-                dataset_resolver=self.dataset_name_for,
-                rootfs_resolver=self.rootfs_path_for,
-                qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
-            )
-        elif resolved_options.filesystem_backend == "overlay":
-            self._fs = OverlayProvider(
-                overlay_root=self._paths.overlay_root or self._paths.btrfs_root / "overlay",
-                runtime_name=self.name,
-                run_command=self._run_command,
-                run_status=self._run_status,
-                dataset_resolver=self.dataset_name_for,
-                rootfs_resolver=self.rootfs_path_for,
-                qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
-            )
-        elif resolved_options.filesystem_backend == "zfs":
-            self._fs = ZfsProvider(
-                dataset_prefix=self._paths.zfs_dataset_prefix,
-                runtime_name=self.name,
-                run_command=self._run_command,
-                run_status=self._run_status,
-                dataset_resolver=self.dataset_name_for,
-                rootfs_resolver=self.rootfs_path_for,
-                zfs_bin=zfs_bin,
-            )
-        else:
-            raise ValueError(
-                f"unsupported filesystem_backend: {resolved_options.filesystem_backend!r} "
-                "(expected 'zfs', 'btrfs' or 'overlay')"
-            )
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
         # In-flight `runc exec` subprocesses keyed by sandbox. The spot
@@ -359,11 +296,53 @@ class RuncRuntime(Runtime):
         md = dict(metadata or {})
         bundle_path = Path(str(md["bundle_path"])) if "bundle_path" in md else self._paths.bundle_root / str(sandbox_id)
         rootfs_path = bundle_path / "rootfs"
-        dataset = str(md.get("zfs_dataset", self._fs.default_dataset_name(sandbox_id)))
+        dataset = str(md.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
         return sandbox_id, md, bundle_path, rootfs_path, dataset
 
+    def _shared_rootfs_details(self, key: str, *, persist_across_runs: bool) -> tuple[str, Path]:
+        if persist_across_runs:
+            dataset = f"{self._paths.zfs_dataset_prefix}-cache-{key}"
+        else:
+            dataset = f"{self._paths.zfs_dataset_prefix}/_shared_rootfs_{key}"
+        safe_prefix = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in self._paths.zfs_dataset_prefix
+        )
+        scope = "persistent" if persist_across_runs else "run"
+        mountpoint = Path("/tmp/crab-rootfs-cache") / safe_prefix / scope / key
+        return dataset, mountpoint
+
     def _shared_rootfs_lock_path(self, key: str, *, persist_across_runs: bool) -> Path:
-        return self._fs.shared_rootfs_lock_path(key, persist_across_runs=persist_across_runs)
+        safe_prefix = "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "_"
+            for char in self._paths.zfs_dataset_prefix
+        )
+        scope = "persistent" if persist_across_runs else "run"
+        return Path("/tmp/crab-rootfs-cache-locks") / safe_prefix / scope / f"{key}.lock"
+
+    def _zfs_object_exists(self, name: str) -> bool:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "name", name],
+            operation="sandbox.zfs_list",
+            check=False,
+            metadata={"name": name},
+        )
+        return result.returncode == 0
+
+    def _destroy_dataset_by_name(
+        self,
+        dataset: str,
+        *,
+        operation: str,
+        sandbox_id: SandboxId | None = None,
+    ) -> None:
+        self._run_command(
+            [self._zfs_bin, "destroy", "-r", dataset],
+            operation=operation,
+            sandbox_id=sandbox_id,
+            check=False,
+            metadata={"dataset": dataset},
+        )
 
     def _prepare_launch_attributes(
         self,
@@ -446,7 +425,7 @@ class RuncRuntime(Runtime):
         persist_across_runs: bool,
         metadata: dict[str, object],
     ) -> tuple[str, Path]:
-        dataset, mountpoint = self._fs.shared_rootfs_details(key, persist_across_runs=persist_across_runs)
+        dataset, mountpoint = self._shared_rootfs_details(key, persist_across_runs=persist_across_runs)
         snapshot = f"{dataset}@{_SHARED_ROOTFS_SNAPSHOT_NAME}"
         lock_path = self._shared_rootfs_lock_path(key, persist_across_runs=persist_across_runs)
         operation = start_operation(
@@ -474,31 +453,27 @@ class RuncRuntime(Runtime):
                 ),
             )
             try:
-                dataset_exists = self._fs.object_exists(dataset)
-                snapshot_exists = self._fs.object_exists(snapshot)
+                dataset_exists = self._zfs_object_exists(dataset)
+                snapshot_exists = self._zfs_object_exists(snapshot)
                 if dataset_exists and snapshot_exists:
                     operation.finish(status="succeeded", attributes={"cache_hit": True})
                     return dataset, mountpoint
                 if dataset_exists and not snapshot_exists:
-                    self._fs.destroy_dataset(
+                    self._destroy_dataset_by_name(
                         dataset,
                         operation="sandbox.zfs_destroy_incomplete_shared_rootfs",
                     )
-                if str(mountpoint) != dataset:
-                    # btrfs uses the subvolume path itself as the
-                    # mountpoint; pre-creating it as a plain directory
-                    # would break `btrfs subvolume create`.
-                    mountpoint.mkdir(parents=True, exist_ok=True)
-                self._fs.create_dataset(
-                    dataset,
-                    mountpoint,
+                mountpoint.mkdir(parents=True, exist_ok=True)
+                self._run_command(
+                    [self._zfs_bin, "create", "-o", f"mountpoint={mountpoint}", dataset],
                     operation="sandbox.zfs_create_shared_rootfs",
+                    metadata={"dataset": dataset, "mountpoint": str(mountpoint)},
                 )
                 self._materialize_rootfs(mountpoint, metadata)
-                self._fs.create_snapshot(
-                    dataset,
-                    snapshot,
+                self._run_command(
+                    [self._zfs_bin, "snapshot", snapshot],
                     operation="sandbox.zfs_snapshot_shared_rootfs",
+                    metadata={"dataset": dataset, "snapshot": snapshot},
                 )
             except Exception:
                 operation.finish(status="failed")
@@ -546,7 +521,7 @@ class RuncRuntime(Runtime):
             bundle_path.mkdir(parents=True, exist_ok=True)
             rootfs_path.mkdir(parents=True, exist_ok=True)
             reuse_existing_rootfs = bool(md.get(_LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY, False))
-            if reuse_existing_rootfs and self._fs.dataset_exists(dataset):
+            if reuse_existing_rootfs and self._zfs_dataset_exists(dataset):
                 if metadata is not None:
                     metadata["rootfs_path"] = str(rootfs_path)
                     metadata["zfs_dataset"] = dataset
@@ -567,31 +542,35 @@ class RuncRuntime(Runtime):
                     persist_across_runs=bool(md.get(_SHARED_ROOTFS_PERSIST_METADATA_KEY, False)),
                     metadata=md,
                 )
-                self._fs.destroy_dataset(
+                self._destroy_dataset_by_name(
                     dataset,
                     operation="sandbox.zfs_destroy_stale_launch_dataset",
                     sandbox_id=sandbox_id,
                 )
                 shared_snapshot = f"{shared_dataset}@{_SHARED_ROOTFS_SNAPSHOT_NAME}"
-                self._fs.clone_shared_base(
-                    shared_dataset,
-                    shared_snapshot,
-                    dataset,
-                    rootfs_path,
+                self._run_command(
+                    [self._zfs_bin, "clone", "-o", f"mountpoint={rootfs_path}", shared_snapshot, dataset],
+                    operation="sandbox.zfs_clone_launch_rootfs",
                     sandbox_id=sandbox_id,
+                    metadata={
+                        "source_dataset": shared_dataset,
+                        "target_dataset": dataset,
+                        "snapshot": shared_snapshot,
+                        "mountpoint": str(rootfs_path),
+                    },
                 )
                 self._sync_clone_view_for_test_runner(shared_rootfs_path, rootfs_path)
             else:
-                self._fs.destroy_dataset(
+                self._destroy_dataset_by_name(
                     dataset,
                     operation="sandbox.zfs_destroy_stale_launch_dataset",
                     sandbox_id=sandbox_id,
                 )
-                self._fs.create_dataset(
-                    dataset,
-                    rootfs_path,
+                self._run_command(
+                    [self._zfs_bin, "create", "-o", f"mountpoint={rootfs_path}", dataset],
                     operation="sandbox.zfs_create",
                     sandbox_id=sandbox_id,
+                    metadata={"dataset": dataset, "mountpoint": str(rootfs_path)},
                     timeout_seconds=self._zfs_prepare_timeout_seconds,
                 )
                 self._materialize_rootfs(rootfs_path, md, sandbox_id=sandbox_id)
@@ -661,11 +640,6 @@ class RuncRuntime(Runtime):
             self._items[sandbox_id] = description
         self._persist(description)
         self._register_with_host_inspector(description)
-        self._record_lifecycle_action(
-            sandbox_id,
-            "launch",
-            metadata={"runtime_name": runtime_name, "bundle_path": str(bundle_path)},
-        )
         logger.info(
             "Launched runtime sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s",
             sandbox_id,
@@ -812,24 +786,6 @@ class RuncRuntime(Runtime):
         description = self.describe(sandbox_id)
         self._update_description(replace(description, status="running" if is_running else "stopped"))
 
-    def adopt_sandbox_description(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        runtime_name: str,
-        status: str,
-        metadata: dict[str, object],
-    ) -> None:
-        description = SandboxDescription(
-            sandbox_id=sandbox_id,
-            runtime_name=runtime_name,
-            status=status,
-            metadata=dict(metadata),
-        )
-        with self._lock:
-            self._items[sandbox_id] = description
-        self._persist(description)
-
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
 
@@ -852,34 +808,6 @@ class RuncRuntime(Runtime):
                 self._host_inspector_client.unregister_sandbox(sandbox_id)
             except Exception:
                 logger.exception("Failed to unregister sandbox %s from host inspector", sandbox_id)
-
-    def update_network_metadata(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        guest_ip: str,
-        network_namespace_path: str,
-    ) -> None:
-        """Re-point an already-launched sandbox's network metadata.
-
-        Launch metadata is written once by the SDK from the sandbox's network
-        lease and is otherwise immutable. Promotion breaks that assumption:
-        the source identity adopts the fork's lease, so the address recorded
-        at launch becomes dead. Two readers depend on it — the engine's
-        interceptor attribution fallback and `Sandbox.get_host` — so the
-        metadata is part of the identity swap, not cosmetic.
-
-        Missing sandboxes are ignored: the caller is mid-swap and a sandbox
-        without a description has no metadata to correct.
-        """
-        with self._lock:
-            description = self._items.get(sandbox_id)
-        if description is None:
-            return
-        new_metadata = dict(description.metadata)
-        new_metadata["guest_ip"] = guest_ip
-        new_metadata["network_namespace_path"] = network_namespace_path
-        self._update_description(replace(description, metadata=new_metadata))
 
     def update_host_inspector_filters(
         self,
@@ -1025,7 +953,6 @@ class RuncRuntime(Runtime):
         command.append(str(sandbox_id))
         command.extend(argv)
         started = time.perf_counter()
-        started_at_iso = utc_now().isoformat()
         stdout_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         stderr_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         operation_context = start_operation(
@@ -1058,21 +985,6 @@ class RuncRuntime(Runtime):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 stdout, stderr = proc.communicate()
-                self._record_exec_action(
-                    sandbox_id,
-                    argv=argv,
-                    cwd=cwd,
-                    env=env,
-                    user=user,
-                    timeout_s=timeout_s,
-                    capture_output=capture_output,
-                    returncode=None,
-                    duration_ms=(time.perf_counter() - started) * 1000.0,
-                    stdout=stdout,
-                    stderr=stderr,
-                    started_at=started_at_iso,
-                    timed_out=True,
-                )
                 raise
         finally:
             with self._active_execs_lock:
@@ -1086,20 +998,6 @@ class RuncRuntime(Runtime):
         stdout = "" if completed.stdout is None else completed.stdout
         stderr = "" if completed.stderr is None else completed.stderr
         success = completed.returncode == 0
-        self._record_exec_action(
-            sandbox_id,
-            argv=argv,
-            cwd=cwd,
-            env=env,
-            user=user,
-            timeout_s=timeout_s,
-            capture_output=capture_output,
-            returncode=int(completed.returncode),
-            duration_ms=duration_ms,
-            stdout=stdout,
-            stderr=stderr,
-            started_at=started_at_iso,
-        )
         operation_context.finish(
             status="succeeded" if success else "failed",
             attributes=self._command_finish_attributes(
@@ -1149,144 +1047,6 @@ class RuncRuntime(Runtime):
             ),
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
-
-    def stream_exec(
-        self,
-        sandbox_id: SandboxId,
-        argv: list[str],
-        *,
-        cwd: str | None = None,
-        env: dict[str, object] | None = None,
-        user: str | None = None,
-        timeout_s: float | None = None,
-    ) -> Iterator[tuple[str, str]]:
-        """Streaming exec: yields (channel, text) tuples as output arrives.
-
-        channel is one of 'stdout', 'stderr', or 'exit'. The final yield
-        is always ('exit', str(returncode)).
-        """
-        command = [self._runtime_bin, "--root", str(self._paths.state_root), "exec"]
-        if cwd:
-            command.extend(["--cwd", cwd])
-        if user:
-            command.extend(["--user", user])
-        for key, value in sorted((env or {}).items()):
-            command.extend(["--env", f"{key}={value}"])
-        command.append(str(sandbox_id))
-        command.extend(argv)
-
-        deadline = (time.monotonic() + timeout_s) if timeout_s else None
-        proc = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        with self._active_execs_lock:
-            self._active_execs.setdefault(sandbox_id, set()).add(proc)
-        sel = selectors.DefaultSelector()
-        try:
-            # Set stdout/stderr to non-blocking
-            os.set_blocking(proc.stdout.fileno(), False)
-            os.set_blocking(proc.stderr.fileno(), False)
-            sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
-            sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
-            open_count = 2
-            while open_count > 0:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        proc.kill()
-                        proc.wait()
-                        yield ("exit", "-1")
-                        return
-                else:
-                    remaining = None
-                events = sel.select(timeout=remaining)
-                if not events:
-                    # select timed out
-                    proc.kill()
-                    proc.wait()
-                    yield ("exit", "-1")
-                    return
-                for key, _ in events:
-                    data = key.fileobj.read(65536)  # type: ignore[union-attr]
-                    if not data:
-                        sel.unregister(key.fileobj)
-                        open_count -= 1
-                        continue
-                    channel = key.data
-                    text = data.decode("utf-8", errors="replace")
-                    yield (channel, text)
-            proc.wait()
-            yield ("exit", str(proc.returncode))
-        finally:
-            sel.close()
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-            with self._active_execs_lock:
-                bucket = self._active_execs.get(sandbox_id)
-                if bucket is not None:
-                    bucket.discard(proc)
-                    if not bucket:
-                        self._active_execs.pop(sandbox_id, None)
-
-    def _record_exec_action(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        argv: list[str],
-        cwd: str | None,
-        env: dict[str, object] | None,
-        user: str | None,
-        timeout_s: float | None,
-        capture_output: bool,
-        returncode: int | None,
-        duration_ms: float,
-        stdout: str | None,
-        stderr: str | None,
-        started_at: str,
-        timed_out: bool = False,
-    ) -> None:
-        """Best-effort action-journal record; never breaks exec."""
-        recorder = self.action_recorder
-        if recorder is None:
-            return
-        try:
-            recorder.record_exec(
-                sandbox_id,
-                argv=argv,
-                cwd=cwd,
-                env=env,
-                user=user,
-                timeout_s=timeout_s,
-                capture_output=capture_output,
-                returncode=returncode,
-                duration_ms=duration_ms,
-                stdout=stdout,
-                stderr=stderr,
-                started_at=started_at,
-                finished_at=utc_now().isoformat(),
-                timed_out=timed_out,
-            )
-        except Exception:
-            logger.exception("Action journal record_exec failed for %s", sandbox_id)
-
-    def _record_lifecycle_action(
-        self,
-        sandbox_id: SandboxId,
-        event: str,
-        *,
-        metadata: dict[str, object] | None = None,
-    ) -> None:
-        recorder = self.action_recorder
-        if recorder is None:
-            return
-        try:
-            recorder.record_lifecycle(sandbox_id, event, metadata=metadata)
-        except Exception:
-            logger.exception("Action journal record_lifecycle failed for %s", sandbox_id)
 
     def cancel_active_execs(self, sandbox_id: SandboxId, *, timeout_s: float = 2.0) -> int:
         """Terminate all in-flight `runc exec` subprocesses targeting
@@ -1553,18 +1313,13 @@ class RuncRuntime(Runtime):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
-        *,
-        lazy_pages: bool | None = None,
     ) -> RuntimeOperationStatus:
-        # Per-call override for fork-style restores that want a fast return
-        # (Sandbox.fork(lazy=True)) without flipping the configured default.
-        resolved_lazy_pages = self._restore_options.lazy_pages if lazy_pages is None else bool(lazy_pages)
         image_path = Path(self.process_checkpoint_location(sandbox_id, checkpoint_id) or "")
         work_path = self.process_work_path(sandbox_id, checkpoint_id)
         image_path.mkdir(parents=True, exist_ok=True)
         work_path.mkdir(parents=True, exist_ok=True)
         lazy_daemon_pid: int | None = None
-        if resolved_lazy_pages:
+        if self._restore_options.lazy_pages:
             lazy_daemon_pid = self._spawn_lazy_pages_daemon(
                 sandbox_id=sandbox_id,
                 checkpoint_id=checkpoint_id,
@@ -1577,7 +1332,7 @@ class RuncRuntime(Runtime):
         command.extend(
             ["--bundle", str(self.bundle_path_for(sandbox_id)), "--image-path", str(image_path), "--work-path", str(work_path)]
         )
-        command.extend(self._restore_optional_args(lazy_pages=resolved_lazy_pages))
+        command.extend(self._restore_optional_args())
         command.append(str(sandbox_id))
         try:
             return self._run_status(
@@ -1592,7 +1347,7 @@ class RuncRuntime(Runtime):
                     "work_path": str(work_path),
                     "bundle_path": str(self.bundle_path_for(sandbox_id)),
                     "state_root": str(self._paths.state_root),
-                    "lazy_pages": resolved_lazy_pages,
+                    "lazy_pages": bool(self._restore_options.lazy_pages),
                     "lazy_pages_daemon_pid": lazy_daemon_pid,
                 },
             )
@@ -1899,35 +1654,88 @@ class RuncRuntime(Runtime):
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> RuntimeOperationStatus:
-        return self._fs.checkpoint_filesystem(sandbox_id, checkpoint_id)
+        dataset = self.dataset_name_for(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        status = self._run_status(
+            [self._zfs_bin, "snapshot", snapshot],
+            operation="sandbox.checkpoint_filesystem",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata=self.filesystem_checkpoint_metadata(sandbox_id, checkpoint_id),
+        )
+        written_bytes, used_bytes = self._query_zfs_snapshot_sizes(snapshot, sandbox_id=sandbox_id, checkpoint_id=checkpoint_id)
+        return replace(
+            status,
+            metadata={
+                **status.metadata,
+                "checkpoint_scope": "filesystem_only",
+                "filesystem_checkpoint_written_bytes": written_bytes,
+                "filesystem_checkpoint_used_bytes": used_bytes,
+            },
+        )
 
     def restore_filesystem(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> RuntimeOperationStatus:
-        return self._fs.restore_filesystem(sandbox_id, checkpoint_id)
+        dataset = self.dataset_name_for(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        metadata: dict[str, object] = {
+            "phase": "filesystem_restore",
+            "runtime": self.name,
+            "dataset": dataset,
+            "snapshot": snapshot,
+            "mountpoint": str(self.rootfs_path_for(sandbox_id)),
+        }
+        origin = self._query_zfs_origin(dataset)
+        if origin is not None and origin.endswith(f"@{checkpoint_id}"):
+            # Dataset is a clone of the requested snapshot; its live state
+            # already matches, so rollback would be a no-op. Skipping avoids a
+            # same-name snapshot on the clone which would later collide with
+            # `zfs promote`.
+            return RuntimeOperationStatus(
+                executed=False,
+                reason="clone_origin_matches_checkpoint",
+                command=(self._zfs_bin, "rollback", "-r", snapshot),
+                metadata={**metadata, "origin": origin},
+            )
+        return self._run_status(
+            [self._zfs_bin, "rollback", "-r", snapshot],
+            operation="sandbox.restore_filesystem",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata=metadata,
+        )
+
+    def _query_zfs_origin(self, dataset: str) -> str | None:
+        result = self._run_command(
+            [self._zfs_bin, "get", "-H", "-o", "value", "origin", dataset],
+            operation="sandbox.zfs_get_origin",
+            check=False,
+            metadata={"dataset": dataset},
+        )
+        if result.returncode != 0:
+            return None
+        value = result.stdout.strip()
+        if not value or value == "-":
+            return None
+        return value
 
     def filesystem_checkpoint_metadata(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> dict[str, object]:
-        return self._fs.filesystem_checkpoint_metadata(sandbox_id, checkpoint_id)
-
-    def changeset_since(
-        self,
-        sandbox_id: SandboxId,
-        checkpoint_id: CheckpointId,
-    ) -> list[ChangesetEntry]:
-        return self._fs.changeset_since(sandbox_id, checkpoint_id)
-
-    def snapshot_content_root(
-        self,
-        sandbox_id: SandboxId,
-        checkpoint_id: CheckpointId,
-    ) -> Path:
-        return self._fs.snapshot_content_root(sandbox_id, checkpoint_id)
+        dataset = self.dataset_name_for(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        return {
+            "phase": "filesystem_checkpoint",
+            "runtime": self.name,
+            "dataset": dataset,
+            "snapshot": snapshot,
+            "mountpoint": str(self.rootfs_path_for(sandbox_id)),
+        }
 
     def delete_runtime(
         self,
@@ -1993,14 +1801,85 @@ class RuncRuntime(Runtime):
         description = self._try_describe(sandbox_id)
         dataset = None if description is None else str(description.metadata.get("zfs_dataset", "")) or None
         if not dataset:
-            dataset = self._fs.default_dataset_name(sandbox_id)
-        self._fs.destroy_filesystem_dataset(sandbox_id, dataset)
-
-    def destroy_filesystem_ref(self, fs_ref: str) -> None:
-        self._fs.destroy_snapshot_ref(fs_ref)
+            dataset = f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
+        result: CommandResult | None = None
+        stderr = ""
+        for attempt in range(1, _DATASET_DESTROY_BUSY_RETRIES + 1):
+            result = self._run_command(
+                [self._zfs_bin, "destroy", "-r", dataset],
+                operation="sandbox.zfs_destroy",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"dataset": dataset, "attempt": attempt},
+            )
+            stderr = result.stderr.strip()
+            if result.returncode == 0 or "does not exist" in stderr:
+                return
+            if "dataset is busy" not in stderr:
+                break
+            if attempt < _DATASET_DESTROY_BUSY_RETRIES:
+                logger.warning(
+                    "ZFS dataset destroy reported busy; retrying sandbox=%s dataset=%s attempt=%d/%d stderr=%s",
+                    sandbox_id,
+                    dataset,
+                    attempt,
+                    _DATASET_DESTROY_BUSY_RETRIES,
+                    stderr,
+                )
+                time.sleep(_DATASET_DESTROY_BUSY_RETRY_DELAY_S)
+        assert result is not None
+        if result.returncode != 0 and "does not exist" not in stderr:
+            raise RuntimeError(
+                f"command failed ({result.returncode}): {self._zfs_bin} destroy -r {dataset}"
+                f"\nstdout: {result.stdout.strip()}"
+                f"\nstderr: {stderr}"
+            )
 
     def promote_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
-        self._fs.promote_filesystem_dataset(sandbox_id)
+        dataset = self.dataset_name_for(sandbox_id)
+        last_result: CommandResult | None = None
+        last_stderr = ""
+        for attempt in range(1, _DATASET_PROMOTE_CONFLICT_RETRIES + 1):
+            result = self._run_command(
+                [self._zfs_bin, "promote", dataset],
+                operation="sandbox.zfs_promote",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"dataset": dataset, "attempt": attempt},
+            )
+            stderr = result.stderr.strip()
+            if result.returncode == 0:
+                return
+            if "not a cloned filesystem" in stderr or "does not exist" in stderr:
+                return
+            conflict_match = _PROMOTE_CONFLICTING_SNAPSHOT_RE.search(stderr)
+            if conflict_match is None:
+                last_result = result
+                last_stderr = stderr
+                break
+            snapshot_name = conflict_match.group(1)
+            logger.warning(
+                "ZFS dataset promote reported conflicting snapshot; deleting child snapshot and retrying "
+                "sandbox=%s dataset=%s snapshot=%s attempt=%d/%d",
+                sandbox_id,
+                dataset,
+                snapshot_name,
+                attempt,
+                _DATASET_PROMOTE_CONFLICT_RETRIES,
+            )
+            self._destroy_dataset_snapshot(
+                dataset,
+                snapshot_name,
+                sandbox_id=sandbox_id,
+            )
+            last_result = result
+            last_stderr = stderr
+        assert last_result is not None
+        raise RuntimeError(
+            f"command failed ({last_result.returncode}): {self._zfs_bin} promote {dataset}"
+            f"\nstdout: {last_result.stdout.strip()}"
+            f"\nstderr: {last_stderr}"
+        )
 
     def clone_filesystem_snapshot(
         self,
@@ -2010,12 +1889,24 @@ class RuncRuntime(Runtime):
         *,
         target_rootfs_path: Path,
     ) -> str:
-        return self._fs.clone_filesystem_snapshot(
-            source_sandbox_id,
-            checkpoint_id,
-            target_sandbox_id,
-            target_rootfs_path=target_rootfs_path,
+        source_dataset = self.dataset_name_for(source_sandbox_id)
+        target_dataset = f"{self._paths.zfs_dataset_prefix}/{target_sandbox_id}"
+        self._run_command(
+            [self._zfs_bin, "destroy", "-r", target_dataset],
+            operation="sandbox.zfs_destroy_clone_target",
+            sandbox_id=target_sandbox_id,
+            check=False,
+            metadata={"dataset": target_dataset},
         )
+        snapshot = f"{source_dataset}@{checkpoint_id}"
+        self._run_command(
+            [self._zfs_bin, "clone", "-o", f"mountpoint={target_rootfs_path}", snapshot, target_dataset],
+            operation="sandbox.zfs_clone",
+            sandbox_id=target_sandbox_id,
+            checkpoint_id=checkpoint_id,
+            metadata={"source_dataset": source_dataset, "target_dataset": target_dataset, "mountpoint": str(target_rootfs_path)},
+        )
+        return target_dataset
 
     def bundle_path_for(self, sandbox_id: SandboxId) -> Path:
         description = self._try_describe(sandbox_id)
@@ -2032,8 +1923,41 @@ class RuncRuntime(Runtime):
     def dataset_name_for(self, sandbox_id: SandboxId) -> str:
         description = self._try_describe(sandbox_id)
         if description is None:
-            return self._fs.default_dataset_name(sandbox_id)
-        return str(description.metadata.get("zfs_dataset", self._fs.default_dataset_name(sandbox_id)))
+            return f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
+        return str(description.metadata.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
+
+    def _destroy_dataset_snapshot(
+        self,
+        dataset: str,
+        snapshot_name: str,
+        *,
+        sandbox_id: SandboxId,
+    ) -> None:
+        snapshot = f"{dataset}@{snapshot_name}"
+        result = self._run_command(
+            [self._zfs_bin, "destroy", snapshot],
+            operation="sandbox.zfs_destroy_snapshot",
+            sandbox_id=sandbox_id,
+            check=False,
+            metadata={"dataset": dataset, "snapshot": snapshot},
+        )
+        stderr = result.stderr.strip()
+        if result.returncode == 0 or "does not exist" in stderr or "snapshot does not exist" in stderr:
+            return
+        raise RuntimeError(
+            f"command failed ({result.returncode}): {self._zfs_bin} destroy {snapshot}"
+            f"\nstdout: {result.stdout.strip()}"
+            f"\nstderr: {stderr}"
+        )
+
+    def _zfs_dataset_exists(self, dataset: str) -> bool:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "name", dataset],
+            operation="sandbox.zfs_exists",
+            check=False,
+            metadata={"dataset": dataset},
+        )
+        return result.returncode == 0
 
     def process_work_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
         return self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "work"
@@ -2060,7 +1984,32 @@ class RuncRuntime(Runtime):
                     checkpoint_id,
                     process_root,
                 )
-        self._fs.discard_partial_checkpoint(sandbox_id, checkpoint_id)
+        dataset = self.dataset_name_for(sandbox_id)
+        snapshot = f"{dataset}@{checkpoint_id}"
+        if self._zfs_snapshot_exists(snapshot):
+            try:
+                self._run_command(
+                    [self._zfs_bin, "destroy", snapshot],
+                    operation="sandbox.discard_partial_checkpoint",
+                    check=False,
+                    metadata={"snapshot": snapshot},
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to destroy partial zfs snapshot sandbox=%s checkpoint=%s snapshot=%s",
+                    sandbox_id,
+                    checkpoint_id,
+                    snapshot,
+                )
+
+    def _zfs_snapshot_exists(self, snapshot: str) -> bool:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "name", "-t", "snapshot", snapshot],
+            operation="sandbox.zfs_snapshot_exists",
+            check=False,
+            metadata={"snapshot": snapshot},
+        )
+        return result.returncode == 0
 
     def _persist(self, description: SandboxDescription) -> None:
         path = self._metadata_path(description.sandbox_id)
@@ -2342,8 +2291,7 @@ class RuncRuntime(Runtime):
         args.extend(self._checkpoint_options.extra_args)
         return args
 
-    def _restore_optional_args(self, *, lazy_pages: bool | None = None) -> list[str]:
-        resolved_lazy_pages = self._restore_options.lazy_pages if lazy_pages is None else bool(lazy_pages)
+    def _restore_optional_args(self) -> list[str]:
         args: list[str] = []
         if self._restore_options.tcp_established:
             args.append("--tcp-established")
@@ -2351,7 +2299,7 @@ class RuncRuntime(Runtime):
             args.append("--shell-job")
         if self._restore_options.ext_unix_sk:
             args.append("--ext-unix-sk")
-        if resolved_lazy_pages:
+        if self._restore_options.lazy_pages:
             args.append("--lazy-pages")
         args.extend(self._restore_options.extra_args)
         return args
@@ -2371,3 +2319,33 @@ class RuncRuntime(Runtime):
         except OSError:
             return 0, 0
         return size_bytes, file_count
+
+    def _query_zfs_snapshot_sizes(
+        self,
+        snapshot: str,
+        *,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> tuple[int | None, int | None]:
+        result = self._run_command(
+            [self._zfs_bin, "get", "-Hp", "-o", "property,value", "written,used", snapshot],
+            operation="sandbox.zfs_snapshot_stats",
+            sandbox_id=sandbox_id,
+            checkpoint_id=checkpoint_id,
+            check=False,
+            metadata={"snapshot": snapshot},
+        )
+        if result.returncode != 0:
+            return None, None
+        values: dict[str, int] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            property_name = parts[0].strip()
+            raw_value = parts[1].strip()
+            try:
+                values[property_name] = int(raw_value)
+            except ValueError:
+                continue
+        return values.get("written"), values.get("used")

@@ -110,14 +110,6 @@ from .engine import (
     shutdown_default_engine,
 )
 from .sandbox import Sandbox
-from .txn import (
-    Transaction,
-    TxnAbortError,
-    TxnActiveError,
-    TxnError,
-    TxnMismatchError,
-    TxnResolvedError,
-)
 
 # Eager import so the side-effect registrations land before the user
 # references any name from this module.
@@ -128,12 +120,6 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "Sandbox",
-    "Transaction",
-    "TxnAbortError",
-    "TxnActiveError",
-    "TxnError",
-    "TxnMismatchError",
-    "TxnResolvedError",
     "TaskResult",
     "get_default_engine",
     "list_agents",

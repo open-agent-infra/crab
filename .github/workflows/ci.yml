@@ -15,14 +15,13 @@ concurrency:
 
 jobs:
   tests:
-    name: Python ${{ matrix.python-version }} (${{ matrix.extras }})
+    name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
-        extras: ["base", "tls"]
 
     steps:
       - uses: actions/checkout@v4
@@ -35,11 +34,7 @@ jobs:
       - name: Install Crab
         run: |
           python -m pip install --upgrade pip
-          if [ "${{ matrix.extras }}" = "tls" ]; then
-            python -m pip install -e '.[tls]'
-          else
-            python -m pip install -e .
-          fi
+          python -m pip install -e .
 
       - name: Run dependency-light tests
         run: |
@@ -47,17 +42,7 @@ jobs:
             tests.test_remote_engine_checkpoint \
             tests.test_image_runtime \
             tests.test_sdk_sandbox \
-            tests.test_resources \
-            tests.test_iflow_trace_replay \
-            tests.test_gateway_registry \
-            tests.test_gateway_server \
-            tests.test_cloud_client \
-            tests.test_exec_streaming \
-            tests.test_port_proxy
-
-      - name: Run TLS tests
-        if: matrix.extras == 'tls'
-        run: python -m pytest tests/test_tls_interception.py -q
+            tests.test_iflow_trace_replay
 
   release-surface:
     name: Release surface
@@ -137,4 +122,3 @@ jobs:
           /tmp/crab-wheel-smoke/bin/python -c "import crab; print(crab.__file__)"
           /tmp/crab-wheel-smoke/bin/crab --help >/dev/null
           /tmp/crab-wheel-smoke/bin/crabd --help >/dev/null
-          /tmp/crab-wheel-smoke/bin/crab-gateway --help >/dev/null

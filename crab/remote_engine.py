@@ -29,27 +29,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from .contracts import Runtime
-from .daemon import DaemonClient, DaemonRequestError
+from .daemon import DaemonClient
 from .ids import CheckpointId, SandboxId
-from .models import ChangesetResult, EgressLedger, EgressReplayReport, ExecDone, ExecEvent, JobStatus, MergeReport, ObservationReport, ProcessMergeReport, SandboxDescription, SandboxExecResult, SandboxRuntimeState, SandboxSnapshot, utc_now
-from .journal import ActionRecord
-from .merging import MergeError, MergerHook
-from .process_merge import ProcessMergeConflict
+from .models import JobStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
 from .telemetry import NoopTelemetrySink
-from .txn import (
-    EffectFlushReport,
-    TxnAbortError,
-    TxnAbortResult,
-    TxnActiveError,
-    TxnCommitConflict,
-    TxnCommitResult,
-    TxnDescription,
-    TxnMismatchError,
-    TxnNotAbortable,
-)
 
 if TYPE_CHECKING:
     from .sandbox import Sandbox
@@ -75,41 +61,13 @@ class _LocalInspectorShim:
     the local `Sandbox._mark_inspector_running` call is best-effort
     bookkeeping for the in-process world. Swallow the call so we don't
     have to refactor every existing call site that pokes the inspector
-    pre-launch.
-
-    ``inspect()`` proxies to the daemon's read-only inspector peek route
-    (``GET /sandboxes/{id}/inspector``) so the SDK can render the observer
-    flags without resetting them."""
-
-    def __init__(self, client: "DaemonClient | None" = None) -> None:
-        self._client = client
+    pre-launch."""
 
     def upsert_snapshot(self, *_, **__) -> None:
         return None
 
     def mark_changed(self, *_, **__) -> None:
         return None
-
-    def inspect(self, sandbox_id: SandboxId) -> SandboxSnapshot:
-        """Read-only peek at the daemon's inspector state. Does not reset."""
-        if self._client is None:
-            return SandboxSnapshot(
-                sandbox_id=sandbox_id,
-                runtime_name="",
-                is_running=True,
-                process_changed=False,
-                filesystem_changed=False,
-                observed_at=utc_now(),
-            )
-        response = self._client.get_json(f"/sandboxes/{sandbox_id}/inspector")
-        return SandboxSnapshot(
-            sandbox_id=sandbox_id,
-            runtime_name=str(response.get("runtime_name") or ""),
-            is_running=bool(response.get("is_running", True)),
-            filesystem_changed=bool(response.get("filesystem_changed")),
-            process_changed=bool(response.get("process_changed")),
-            observed_at=utc_now(),
-        )
 
 
 class _RemoteStorageShim:
@@ -161,56 +119,19 @@ class _RemoteStorageShim:
         self._entries.pop((str(sandbox_id), str(checkpoint_id)), None)
 
 
-class _JournalShim:
-    """`ActionJournal.entries()`-shaped reads over the daemon RPC so
-    `Sandbox.actions()` stays transport-agnostic (C3)."""
-
-    def __init__(self, client: DaemonClient) -> None:
-        self._client = client
-
-    def entries(
-        self,
-        sandbox_id: SandboxId | str,
-        *,
-        kind: str | None = None,
-        since_seq: int | None = None,
-    ) -> list[ActionRecord]:
-        payload: dict[str, Any] = {}
-        if kind is not None:
-            payload["kind"] = kind
-        if since_seq is not None:
-            payload["since_seq"] = int(since_seq)
-        response = self._client.post_json(
-            f"/sandboxes/{sandbox_id}/actions",
-            payload,
-            timeout_seconds=60.0,
-        )
-        return [ActionRecord.from_json(row) for row in (response.get("records") or [])]
-
-
 class _SystemShim:
     """`Engine.system`-shaped facade for SDK checkpoint operations."""
 
     def __init__(self, client: DaemonClient) -> None:
         self._client = client
         self.telemetry = NoopTelemetrySink()
-        self.inspector = _LocalInspectorShim(client)
+        self.inspector = _LocalInspectorShim()
         self.storage = _RemoteStorageShim(client)
-        self.journal = _JournalShim(client)
 
-    def checkpoint_once(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        leave_running: bool = True,
-        checkpoint_id: str | None = None,
-    ):
-        payload: dict[str, Any] = {"leave_running": bool(leave_running)}
-        if checkpoint_id is not None:
-            payload["checkpoint_id"] = str(checkpoint_id)
+    def checkpoint_once(self, sandbox_id: SandboxId, *, leave_running: bool = True):
         response = self._client.post_json(
             f"/sandboxes/{sandbox_id}/checkpoints",
-            payload,
+            {"leave_running": bool(leave_running)},
             timeout_seconds=300.0,
         )
         checkpoint_id_raw = response.get("checkpoint_id")
@@ -232,267 +153,6 @@ class _SystemShim:
         )
         status = JobStatus(str(response.get("status") or JobStatus.SUCCEEDED.value))
         return SimpleNamespace(status=status, message="")
-
-    # ----- transactions (see crab/txn.py) ------------------------------
-    # Proxies mirror CrabSystem's txn surface so Sandbox.begin() stays
-    # transport-agnostic. 409 responses carry an `error_type` the daemon
-    # set from the original Txn* exception; map it back so SDK callers
-    # get identical exceptions in both modes.
-
-    def begin_txn(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        label: str | None = None,
-        isolation: str = "snapshot",
-        effects: str | None = None,
-    ) -> TxnDescription:
-        payload: dict[str, Any] = {} if label is None else {"label": label}
-        if isolation != "snapshot":
-            payload["isolation"] = isolation
-        if effects is not None:
-            payload["effects"] = effects
-        try:
-            response = self._client.post_json(
-                f"/sandboxes/{sandbox_id}/txn",
-                payload,
-                timeout_seconds=600.0 if isolation == "fork" else 300.0,  # fork begin = checkpoint + clone + restore
-            )
-        except DaemonRequestError as exc:
-            raise _map_txn_error(exc) from exc
-        return _deserialize_txn(response["txn"])
-
-    def commit_txn(
-        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
-    ) -> TxnCommitResult:
-        try:
-            response = self._client.post_json(
-                f"/sandboxes/{sandbox_id}/txn/{txn_id}/commit",
-                {"force": True} if force else {},
-                timeout_seconds=600.0,  # fork-backed commit swaps fs + processes
-            )
-        except DaemonRequestError as exc:
-            raise _map_txn_error(exc) from exc
-        raw = response["result"]
-        promoted = raw.get("promoted_checkpoint_id")
-        consolidated = raw.get("observations_consolidated")
-        raw_effects = raw.get("effects")
-        return TxnCommitResult(
-            txn_id=str(raw["txn_id"]),
-            released_observations=int(raw["released_observations"]),
-            base_dropped=bool(raw["base_dropped"]),
-            promoted_checkpoint_id=None if promoted is None else str(promoted),
-            observations_consolidated=None if consolidated is None else int(consolidated),
-            # Absent from pre-D3 daemons.
-            effects=(
-                None
-                if not isinstance(raw_effects, dict)
-                else EffectFlushReport.from_json(raw_effects)
-            ),
-        )
-
-    def abort_txn(
-        self, sandbox_id: SandboxId, txn_id: str, *, force: bool = False
-    ) -> TxnAbortResult:
-        try:
-            response = self._client.post_json(
-                f"/sandboxes/{sandbox_id}/txn/{txn_id}/abort",
-                {"force": True} if force else {},
-                timeout_seconds=300.0,  # abort restores the base checkpoint
-            )
-        except DaemonRequestError as exc:
-            raise _map_txn_error(exc) from exc
-        raw = response["result"]
-        restored = raw.get("restored_checkpoint_id")
-        return TxnAbortResult(
-            txn_id=str(raw["txn_id"]),
-            discarded_observations=int(raw["discarded_observations"]),
-            restored_checkpoint_id=None if restored is None else str(restored),
-            # Absent from pre-D1 daemons; 0 is the honest default there.
-            mutating_egress=int(raw.get("mutating_egress") or 0),
-            # Absent from pre-D3 daemons.
-            deferred_dropped=int(raw.get("deferred_dropped") or 0),
-        )
-
-    def current_txn(self, sandbox_id: SandboxId) -> TxnDescription | None:
-        response = self._client.get_json(f"/sandboxes/{sandbox_id}/txn")
-        raw = response.get("txn")
-        return None if raw is None else _deserialize_txn(raw)
-
-    # ----- filesystem merge / changesets (C2) --------------------------
-    # Same transport-agnostic story as the txn proxies: Sandbox.merge and
-    # Sandbox.changeset duck-type onto these, and 409 merge_error bodies
-    # rehydrate into MergeError with the serialized report reattached.
-
-    def merge_from_fork(
-        self,
-        source_sandbox_id: SandboxId,
-        fork_sandbox_id: SandboxId,
-        *,
-        policy: str = "fail_fast",
-        ignore_prefixes: tuple[str, ...] | None = None,
-        merger: MergerHook | None = None,
-        observations: str = "none",
-        observation_summarizer=None,
-    ) -> MergeReport:
-        if merger is not None:
-            raise NotImplementedError(
-                "custom merger hooks cannot cross the daemon RPC; "
-                "use a policy or run a local in-process engine"
-            )
-        if observation_summarizer is not None:
-            raise NotImplementedError(
-                "summarizer hooks cannot cross the daemon RPC; "
-                "run a local in-process engine"
-            )
-        payload: dict[str, Any] = {
-            "fork_sandbox_id": str(fork_sandbox_id),
-            "policy": policy,
-        }
-        if observations != "none":
-            payload["observations"] = observations
-        if ignore_prefixes is not None:
-            payload["ignore_prefixes"] = [str(prefix) for prefix in ignore_prefixes]
-        try:
-            response = self._client.post_json(
-                f"/sandboxes/{source_sandbox_id}/merge",
-                payload,
-                timeout_seconds=600.0,  # quiesce + two backend diffs + apply
-            )
-        except DaemonRequestError as exc:
-            raise _map_merge_error(exc) from exc
-        return MergeReport.from_json(response["report"])
-
-    def changeset_since(
-        self,
-        sandbox_id: SandboxId,
-        checkpoint_id: CheckpointId,
-        *,
-        use_inspector_gate: bool = True,
-    ) -> ChangesetResult:
-        payload: dict[str, Any] = {"since": str(checkpoint_id)}
-        # force=True on the daemon side bypasses the inspector gate.
-        if not use_inspector_gate:
-            payload["force"] = True
-        response = self._client.post_json(
-            f"/sandboxes/{sandbox_id}/changeset",
-            payload,
-            timeout_seconds=300.0,
-        )
-        return ChangesetResult.from_json(response["changeset"])
-
-    def fork_changeset(
-        self, sandbox_id: SandboxId, *, force: bool = False
-    ) -> ChangesetResult:
-        payload: dict[str, Any] = {}
-        if force:
-            payload["force"] = True
-        response = self._client.post_json(
-            f"/sandboxes/{sandbox_id}/changeset",
-            payload,
-            timeout_seconds=300.0,
-        )
-        return ChangesetResult.from_json(response["changeset"])
-
-    def consolidate_observations(
-        self,
-        source_sandbox_id: SandboxId,
-        fork_sandbox_id: SandboxId,
-        *,
-        policy: str = "append",
-        summarizer=None,
-        reason: str = "manual",
-    ) -> ObservationReport:
-        if summarizer is not None:
-            raise NotImplementedError(
-                "summarizer hooks cannot cross the daemon RPC; "
-                "run a local in-process engine"
-            )
-        response = self._client.post_json(
-            f"/sandboxes/{source_sandbox_id}/observations/consolidate",
-            {
-                "fork_sandbox_id": str(fork_sandbox_id),
-                "policy": policy,
-                "reason": reason,
-            },
-            timeout_seconds=60.0,
-        )
-        return ObservationReport.from_json(response["report"])
-
-    def egress_ledger(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        txn_id: str | None = None,
-        since_seq: int | None = None,
-    ) -> EgressLedger:
-        payload: dict[str, Any] = {}
-        if txn_id:
-            payload["txn_id"] = str(txn_id)
-        if since_seq is not None:
-            payload["since_seq"] = int(since_seq)
-        response = self._client.post_json(
-            f"/sandboxes/{sandbox_id}/egress", payload, timeout_seconds=60.0
-        )
-        return EgressLedger.from_json(response["ledger"])
-
-    def begin_egress_replay(
-        self,
-        sandbox_id: SandboxId,
-        *,
-        policy: str = "cassette_first",
-        cassette_source: object | None = None,
-    ) -> None:
-        payload: dict[str, Any] = {"mode": "begin", "policy": policy}
-        if cassette_source is not None:
-            payload["cassette_source"] = str(cassette_source)
-        self._client.post_json(
-            f"/sandboxes/{sandbox_id}/egress/replay", payload, timeout_seconds=60.0
-        )
-
-    def end_egress_replay(self, sandbox_id: SandboxId) -> EgressReplayReport | None:
-        response = self._client.post_json(
-            f"/sandboxes/{sandbox_id}/egress/replay",
-            {"mode": "end"},
-            timeout_seconds=60.0,
-        )
-        raw = response.get("report")
-        return None if not isinstance(raw, dict) else EgressReplayReport.from_json(raw)
-
-    def merge_processes(
-        self,
-        source_sandbox_id: SandboxId,
-        fork_sandbox_id: SandboxId,
-        *,
-        strategy: str = "auto",
-        policy: str = "fail_fast",
-        observations: str = "append",
-        stop_on_deviation: bool = False,
-        lazy_pages: bool = True,
-        force: bool = False,
-        egress_replay: str = "cassette_first",
-        replay_effects: str = "reject",
-    ) -> ProcessMergeReport:
-        payload: dict[str, Any] = {
-            "fork_sandbox_id": str(fork_sandbox_id),
-            "strategy": strategy,
-            "policy": policy,
-            "observations": observations,
-            "stop_on_deviation": bool(stop_on_deviation),
-            "lazy_pages": bool(lazy_pages),
-            "force": bool(force),
-            "egress_replay": egress_replay,
-            "replay_effects": replay_effects,
-        }
-        try:
-            response = self._client.post_json(
-                f"/sandboxes/{source_sandbox_id}/processes/merge",
-                payload,
-                timeout_seconds=600.0,  # replay runs the fork's whole exec history
-            )
-        except DaemonRequestError as exc:
-            raise _map_process_merge_error(exc) from exc
-        return ProcessMergeReport.from_json(response["report"])
 
 
 class _ConfigShim:
@@ -635,43 +295,6 @@ class RuntimeProxy(Runtime):
             stdout=str(raw.get("stdout") or ""),
             stderr=str(raw.get("stderr") or ""),
         )
-
-    def stream_exec(
-        self,
-        sandbox_id: SandboxId,
-        argv: list[str],
-        *,
-        cwd: str | None = None,
-        env: dict[str, str] | None = None,
-        user: str | None = None,
-        timeout_s: float | None = None,
-    ) -> Iterator[ExecEvent | ExecDone]:
-        """Streaming exec: yields ExecEvent/ExecDone as output arrives."""
-        payload: dict[str, Any] = {"argv": list(argv)}
-        if cwd is not None:
-            payload["cwd"] = cwd
-        if env is not None:
-            payload["env"] = dict(env)
-        if user is not None:
-            payload["user"] = user
-        if timeout_s is not None:
-            payload["timeout_s"] = float(timeout_s)
-        http_timeout = (float(timeout_s) + 60.0) if timeout_s else None
-        stream = self._client.stream_post(
-            f"/sandboxes/{sandbox_id}/exec?stream=1",
-            payload,
-            timeout_seconds=http_timeout,
-        )
-        try:
-            for event in stream:
-                if event.get("done"):
-                    yield ExecDone(returncode=int(event.get("rc", -1)))
-                    return
-                ch = event.get("ch", "stdout")
-                text = event.get("t", "")
-                yield ExecEvent(channel=ch, text=text)
-        finally:
-            stream.close()
 
     # ----- daemon-only API surface the SDK needs in addition to Runtime -----
 
@@ -822,15 +445,6 @@ class RemoteEngine:
 
     # ----- daemon-routed operations -----
 
-    def list_sandboxes(self) -> list[dict[str, Any]]:
-        """Return the caller-visible sandboxes as raw dicts.
-
-        Hits ``GET /sandboxes`` on the daemon (or the gateway's tenant-
-        scoped equivalent). Each entry carries at least ``sandbox_id``,
-        ``runtime_name``, ``status`` and ``metadata``."""
-        response = self._client.get_json("/sandboxes")
-        return list(response.get("sandboxes") or [])
-
     def register_upstream(self, sandbox_id: SandboxId, url: str) -> None:
         if not url:
             return
@@ -866,44 +480,6 @@ class RemoteEngine:
         # No corresponding endpoint yet; surface a clean False so the
         # restore path falls back gracefully.
         return False
-
-    def fork_sandbox(
-        self,
-        source_sandbox_id: SandboxId,
-        *,
-        count: int = 1,
-        lazy: bool = False,
-        effects: str | None = None,
-        gate_effects: bool = True,
-    ) -> list[SandboxId]:
-        """Fork via the daemon. Mirrors `Engine.fork_sandbox`; the daemon
-        runs the whole checkpoint + clone + restore pipeline and returns
-        the new sandbox ids. Timeout scales with count the same way
-        checkpoint/restore calls are budgeted (300s each).
-
-        ``effects`` rides the request so a gated fork (F1) is validated and
-        armed daemon-side, before the fork's processes are restored.
-        ``gate_effects=False`` has no remote counterpart: the daemon owns
-        the fork-txn path itself, so it is only accepted here to keep the
-        in-process signature substitutable."""
-        if count < 1:
-            raise ValueError("fork count must be >= 1")
-        if not gate_effects and effects is not None:
-            raise ValueError(
-                "effects= is not accepted when the caller owns the effect window"
-            )
-        payload: dict = {"count": int(count), "lazy": bool(lazy)}
-        if effects is not None:
-            payload["effects"] = str(effects)
-        response = self._client.post_json(
-            f"/sandboxes/{source_sandbox_id}/fork",
-            payload,
-            timeout_seconds=300.0 * count,
-        )
-        return [
-            SandboxId(str(entry["sandbox_id"]))
-            for entry in (response.get("forks") or [])
-        ]
 
     # ----- local sandbox registry (mirrors the in-process Engine) -----
 
@@ -960,79 +536,6 @@ def _make_jsonable(value: Any) -> Any:
         return value
     except (TypeError, ValueError):
         return str(value)
-
-
-def _deserialize_txn(payload: Mapping[str, Any]) -> TxnDescription:
-    base = payload.get("base_checkpoint_id")
-    label = payload.get("label")
-    fork_sandbox_id = payload.get("fork_sandbox_id")
-    return TxnDescription(
-        txn_id=str(payload["txn_id"]),
-        sandbox_id=str(payload["sandbox_id"]),
-        base_checkpoint_id=None if base is None else str(base),
-        base_was_fresh=bool(payload.get("base_was_fresh")),
-        started_at=str(payload.get("started_at") or ""),
-        label=None if label is None else str(label),
-        isolation=str(payload.get("isolation") or "snapshot"),
-        fork_sandbox_id=None if fork_sandbox_id is None else str(fork_sandbox_id),
-        effects=str(payload.get("effects") or "allow"),
-    )
-
-
-def _map_txn_error(exc: DaemonRequestError) -> Exception:
-    """Rehydrate the daemon's 409 error_type into the matching Txn*
-    exception; anything unrecognized re-raises the transport error."""
-    try:
-        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
-    except Exception:
-        payload = {}
-    error_type = payload.get("error_type") if isinstance(payload, dict) else None
-    message = str(payload.get("error")) if isinstance(payload, dict) and payload.get("error") else str(exc)
-    if error_type == "txn_active":
-        return TxnActiveError(message)
-    if error_type == "txn_not_abortable":
-        return TxnNotAbortable(message)
-    if error_type == "txn_mismatch":
-        return TxnMismatchError(message)
-    if error_type == "txn_commit_conflict":
-        return TxnCommitConflict(message)
-    if error_type == "txn_abort_failed":
-        return TxnAbortError(message)
-    return exc
-
-
-def _map_merge_error(exc: DaemonRequestError) -> Exception:
-    """Rehydrate the daemon's 409 merge_error into MergeError, restoring
-    the serialized report when the failure produced one; anything
-    unrecognized re-raises the transport error."""
-    try:
-        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
-    except Exception:
-        payload = {}
-    if not isinstance(payload, dict) or payload.get("error_type") != "merge_error":
-        return exc
-    message = str(payload.get("error")) if payload.get("error") else str(exc)
-    report = None
-    raw_report = payload.get("report")
-    if isinstance(raw_report, dict):
-        try:
-            report = MergeReport.from_json(raw_report)
-        except Exception:
-            logger.exception("Failed to rehydrate merge report from daemon 409")
-    return MergeError(message, report=report)
-
-
-def _map_process_merge_error(exc: DaemonRequestError) -> Exception:
-    """Rehydrate the daemon's 409 process_merge_conflict into the typed
-    exception; anything unrecognized re-raises the transport error."""
-    try:
-        payload = json.loads(exc.body.decode("utf-8", errors="replace"))
-    except Exception:
-        payload = {}
-    if isinstance(payload, dict) and payload.get("error_type") == "process_merge_conflict":
-        message = str(payload.get("error")) if payload.get("error") else str(exc)
-        return ProcessMergeConflict(message)
-    return exc
 
 
 def _deserialize_description(payload: Mapping[str, Any]) -> SandboxDescription:

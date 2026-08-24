@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from collections import deque
-from enum import Enum
-import sys
 import threading
 import time
 import uuid
@@ -37,28 +35,6 @@ def _header_value(headers: dict[str, str], name: str, default: str = "") -> str:
         if key.lower() == lowered:
             return candidate
     return default
-
-
-def _dropped_response(request_id: str) -> tuple[int, list[tuple[str, str]], bytes]:
-    """409 returned to the in-sandbox caller when its staged observation is
-    discarded. The B2 abort flow restores the sandbox to the base
-    checkpoint, so the process that sees this is rewound anyway; the 409
-    exists so a discard *without* a restore fails loudly instead of
-    silently hanging or delivering a dead response."""
-    body = _JSON_CODEC.dumps_bytes(
-        {
-            "error": {
-                "type": "crab_txn_aborted",
-                "message": "response dropped: observation staging scope was aborted",
-                "request_id": request_id,
-            }
-        }
-    )
-    headers = [
-        ("Content-Type", "application/json"),
-        ("Content-Length", str(len(body))),
-    ]
-    return 409, headers, body
 
 
 def _maybe_requested_model(path: str, body: bytes) -> str | None:
@@ -264,15 +240,6 @@ class PendingSandboxResponse:
     request_group_id: str | None = None
 
 
-class ReleaseDisposition(Enum):
-    """What a gated caller should do with the response it is holding once
-    its generation is released: deliver it to the in-sandbox client, or
-    drop it (the observation was staged and the staging scope aborted)."""
-
-    DELIVER = "deliver"
-    DROP = "drop"
-
-
 @dataclass
 class _PendingResponseEntry:
     generation: int
@@ -321,38 +288,11 @@ class SandboxResponseGateRegistry:
                 pending = state["pending"]
                 assert isinstance(pending, dict)
                 pending.clear()
-                staged = state.get("staged")
-                if isinstance(staged, dict):
-                    staged.clear()
             logger.debug("Disabled sandbox response gate registry and released %s sandbox states", len(conditions))
         for condition in conditions:
             assert isinstance(condition, threading.Condition)
             with condition:
                 condition.notify_all()
-
-    def _ensure_state_locked(self, sandbox_id: SandboxId) -> dict:
-        state = self._states.get(sandbox_id)
-        if state is None:
-            state = {
-                "generation": 0,
-                "pending": {},
-                "pending_groups": {},
-                "satisfied_groups": set(),
-                "condition": threading.Condition(),
-                # Observation staging (B1): while `staging` is on,
-                # released generations park in `staged` instead of waking
-                # their waiters; `dropped` records aborted generations so
-                # wait_for_release can report the DROP disposition.
-                "staging": False,
-                "staged": {},
-                "dropped": set(),
-            }
-            self._states[sandbox_id] = state
-        else:
-            state.setdefault("staging", False)
-            state.setdefault("staged", {})
-            state.setdefault("dropped", set())
-        return state
 
     def arm(
         self,
@@ -370,7 +310,17 @@ class SandboxResponseGateRegistry:
                     request_id,
                 )
                 return None
-            state = self._ensure_state_locked(sandbox_id)
+            state = self._states.get(sandbox_id)
+            if state is None:
+                condition = threading.Condition()
+                state = {
+                    "generation": 0,
+                    "pending": {},
+                    "pending_groups": {},
+                    "satisfied_groups": set(),
+                    "condition": condition,
+                }
+                self._states[sandbox_id] = state
             group_key = None
             if request_group_kind and request_group_id:
                 group_key = (request_group_kind, request_group_id)
@@ -426,18 +376,13 @@ class SandboxResponseGateRegistry:
             )
             return generation
 
-    def wait_for_release(
-        self,
-        sandbox_id: SandboxId,
-        generation: int | None,
-        timeout: float | None = None,
-    ) -> ReleaseDisposition:
+    def wait_for_release(self, sandbox_id: SandboxId, generation: int | None, timeout: float | None = None) -> None:
         if generation is None:
-            return ReleaseDisposition.DELIVER
+            return
         with self._lock:
             state = self._states.get(sandbox_id)
             if state is None:
-                return ReleaseDisposition.DELIVER
+                return
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         logger.debug(
@@ -457,13 +402,6 @@ class SandboxResponseGateRegistry:
             generation,
             released,
         )
-        with self._lock:
-            state = self._states.get(sandbox_id)
-            if state is not None:
-                dropped = state.get("dropped")
-                if isinstance(dropped, set) and generation in dropped:
-                    return ReleaseDisposition.DROP
-        return ReleaseDisposition.DELIVER
 
     def get_pending(self, sandbox_id: SandboxId) -> PendingSandboxResponse | None:
         with self._lock:
@@ -573,10 +511,6 @@ class SandboxResponseGateRegistry:
                 )
                 return False
             pending.pop(target_generation, None)
-            if bool(state.get("staging")):
-                staged = state.get("staged")
-                if isinstance(staged, dict):
-                    staged[target_generation] = entry
             group_key = None
             if entry.request_group_kind and entry.request_group_id:
                 group_key = (entry.request_group_kind, entry.request_group_id)
@@ -606,21 +540,14 @@ class SandboxResponseGateRegistry:
                 return
             pending = state["pending"]
             assert isinstance(pending, dict)
-            staging = bool(state.get("staging"))
-            staged = state.get("staged") if staging else None
             if generation is None:
                 pending_groups = state["pending_groups"]
                 assert isinstance(pending_groups, dict)
                 satisfied_groups = state["satisfied_groups"]
                 assert isinstance(satisfied_groups, set)
-                for released_generation, entry in list(pending.items()):
+                for entry in pending.values():
                     if entry.request_group_kind and entry.request_group_id:
                         satisfied_groups.add((entry.request_group_kind, entry.request_group_id))
-                    if isinstance(staged, dict):
-                        # Staging: the generation is released for gating
-                        # purposes (no re-arm) but its waiters stay parked
-                        # until release_staged/discard_staged.
-                        staged[released_generation] = entry
                 pending.clear()
                 pending_groups.clear()
             else:
@@ -632,97 +559,11 @@ class SandboxResponseGateRegistry:
                     satisfied_groups = state["satisfied_groups"]
                     assert isinstance(satisfied_groups, set)
                     satisfied_groups.add((entry.request_group_kind, entry.request_group_id))
-                if entry is not None and isinstance(staged, dict):
-                    staged[generation] = entry
             condition = state["condition"]
             assert isinstance(condition, threading.Condition)
         with condition:
             condition.notify_all()
         logger.debug("Released response gate: sandbox_id=%s generation=%s", sandbox_id, generation)
-
-    # ----- observation staging (B1) -----------------------------------
-
-    def begin_staging(self, sandbox_id: SandboxId) -> None:
-        """Arm staging: from now on, released generations park in the
-        staged buffer instead of waking their waiters. Idempotent; starts
-        a fresh scope (previous drop markers are cleared)."""
-        with self._lock:
-            state = self._ensure_state_locked(sandbox_id)
-            state["staging"] = True
-            dropped = state["dropped"]
-            assert isinstance(dropped, set)
-            dropped.clear()
-        logger.debug("Armed observation staging: sandbox_id=%s", sandbox_id)
-
-    def staging_active(self, sandbox_id: SandboxId) -> bool:
-        with self._lock:
-            state = self._states.get(sandbox_id)
-            return bool(state is not None and state.get("staging"))
-
-    def release_staged(self, sandbox_id: SandboxId) -> int:
-        """Commit: wake all staged waiters with DELIVER. Staging stays
-        armed until end_staging (arm/flush are orthogonal)."""
-        with self._lock:
-            state = self._states.get(sandbox_id)
-            if state is None:
-                return 0
-            staged = state.get("staged")
-            if not isinstance(staged, dict) or not staged:
-                return 0
-            released = len(staged)
-            staged.clear()
-            condition = state["condition"]
-            assert isinstance(condition, threading.Condition)
-        with condition:
-            condition.notify_all()
-        logger.debug("Released %s staged observations: sandbox_id=%s", released, sandbox_id)
-        return released
-
-    def discard_staged(self, sandbox_id: SandboxId) -> int:
-        """Abort: wake all staged waiters with DROP. Drop markers persist
-        until the next begin_staging so late waiters still observe them."""
-        with self._lock:
-            state = self._states.get(sandbox_id)
-            if state is None:
-                return 0
-            staged = state.get("staged")
-            if not isinstance(staged, dict) or not staged:
-                return 0
-            dropped = state.get("dropped")
-            assert isinstance(dropped, set)
-            discarded = len(staged)
-            dropped.update(staged.keys())
-            staged.clear()
-            condition = state["condition"]
-            assert isinstance(condition, threading.Condition)
-        with condition:
-            condition.notify_all()
-        logger.debug("Discarded %s staged observations: sandbox_id=%s", discarded, sandbox_id)
-        return discarded
-
-    def end_staging(self, sandbox_id: SandboxId) -> int:
-        """Disarm staging. Fail-open: anything still staged is delivered —
-        losing isolation is recoverable, silently eating responses is not."""
-        with self._lock:
-            state = self._states.get(sandbox_id)
-            if state is None:
-                return 0
-            state["staging"] = False
-            staged = state.get("staged")
-            leftover = 0
-            if isinstance(staged, dict) and staged:
-                leftover = len(staged)
-                staged.clear()
-            condition = state["condition"]
-            assert isinstance(condition, threading.Condition)
-        with condition:
-            condition.notify_all()
-        logger.debug(
-            "Disarmed observation staging: sandbox_id=%s delivered_leftover=%s",
-            sandbox_id,
-            leftover,
-        )
-        return leftover
 
     def _is_generation_released(self, sandbox_id: SandboxId, generation: int) -> bool:
         with self._lock:
@@ -733,9 +574,6 @@ class SandboxResponseGateRegistry:
                 return True
             pending = state["pending"]
             assert isinstance(pending, dict)
-            staged = state.get("staged")
-            if isinstance(staged, dict) and generation in staged:
-                return False
             return generation not in pending
 
 
@@ -934,7 +772,6 @@ class CrabRequestInterceptor:
         finally:
             gate_wait_ms = 0.0
             released_at = time.perf_counter()
-            disposition = ReleaseDisposition.DELIVER
             if self._response_gate_registry is not None and gate_generation is not None:
                 gate_operation = None if self._telemetry is None else start_operation(
                     self._telemetry,
@@ -942,9 +779,7 @@ class CrabRequestInterceptor:
                     request_attributes,
                 )
                 wait_started = time.perf_counter()
-                disposition = self._response_gate_registry.wait_for_release(
-                    context.sandbox_id, gate_generation
-                )
+                self._response_gate_registry.wait_for_release(context.sandbox_id, gate_generation)
                 released_at = time.perf_counter()
                 gate_wait_ms = (released_at - wait_started) * 1000.0
                 crab_delay_ms = None
@@ -983,20 +818,6 @@ class CrabRequestInterceptor:
             self._hook.on_request_end(context) # record telemetry, etc
             self._notify(context.sandbox_id)
             self._request_state_store.mark_request_end(context)
-            if disposition is ReleaseDisposition.DROP and sys.exc_info()[0] is None:
-                # Overrides the try-block's `return response`. Guarded so an
-                # in-flight exception (upstream failure) still propagates.
-                if self._telemetry is not None:
-                    self._telemetry.emit_event(
-                        "interceptor.response.dropped", request_attributes
-                    )
-                logger.info(
-                    "Dropped staged response: sandbox_id=%s request_id=%s generation=%s",
-                    context.sandbox_id,
-                    context.request_id,
-                    gate_generation,
-                )
-                return _dropped_response(context.request_id)
 
     def _notify(self, sandbox_id: SandboxId) -> None:
         if self._on_state_change is not None:

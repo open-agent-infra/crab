@@ -198,7 +198,9 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(len(results), 4)
         self.assertTrue(all(r.status == JobStatus.SUCCEEDED for r in results))
         self.assertEqual(worker.max_active, 3)
-        self.assertEqual(worker.completed_job_ids, [job.job_id.value for job in jobs])
+        # Completion order across parallel workers is nondeterministic
+        # (jobs in the same batch race); only membership is guaranteed.
+        self.assertEqual(sorted(worker.completed_job_ids), [job.job_id.value for job in jobs])
         self.assertGreater(elapsed, 0.02)
         self.assertLess(elapsed, 0.08)
         queue_waits = [

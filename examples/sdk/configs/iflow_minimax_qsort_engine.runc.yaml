@@ -49,7 +49,7 @@ scheduler:
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
-  incremental_process_enabled: false
+  incremental_process_enabled: true
   full_process_checkpoint_interval: 8
   max_process_chain_length: 16
 

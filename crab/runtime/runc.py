@@ -4,7 +4,8 @@ import fcntl
 import json
 import logging
 import os
-import re
+import selectors
+import signal
 import shutil
 import subprocess
 import time
@@ -12,13 +13,19 @@ import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Lock
+from typing import Iterator
 
-from ..contracts import Runtime, TelemetrySink
+from ..contracts import ActionRecorder, Runtime, TelemetrySink
+from ..errors import SandboxCreateCleanupError, SandboxExecCleanupError, SandboxExecTimeout
 from ..ids import CheckpointId, SandboxId
-from ..models import RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState
+from ..models import ChangesetEntry, RuntimeCapabilities, RuntimeOperationStatus, SandboxDescription, SandboxExecResult, SandboxRuntimeState, utc_now
 from ..remote_inspector import HostInspectorServiceClient
 from ..telemetry import NoopTelemetrySink, start_operation, telemetry_capture_command_output, telemetry_is_detailed
 from .base import CommandResult, CommandRunner, SubprocessCommandRunner
+from .btrfs_provider import BtrfsProvider
+from .fs_provider import FilesystemProvider
+from .overlay_provider import OverlayProvider
+from .zfs_provider import ZfsProvider
 
 logger = logging.getLogger(__name__)
 _HOST_INSPECTOR_REGISTER_ATTEMPTS = 3
@@ -43,14 +50,12 @@ _RUNTIME_DEFAULT_IGNORE_PROCESS_RULES: tuple[dict[str, object], ...] = (
 _RESILIENT_EXEC_RECOVERY_TIMEOUT_S = 300.0
 _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS = 60.0
 _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS = 300.0
-_DATASET_DESTROY_BUSY_RETRIES = 10
-_DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
-_DATASET_PROMOTE_CONFLICT_RETRIES = 8
 _LAUNCH_PREPARED_METADATA_KEY = "_crab_runtime_prepared"
 _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY = "_crab_runtime_reuse_existing_rootfs"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
 _SHARED_ROOTFS_PERSIST_METADATA_KEY = "shared_rootfs_persist"
 _SHARED_ROOTFS_SNAPSHOT_NAME = "base"
+_ROOTFS_POST_CLONE_COPY_PATHS_METADATA_KEY = "rootfs_post_clone_copy_paths"
 _RESILIENT_EXEC_RETRYABLE_ERROR_FRAGMENTS = (
     "container does not exist",
     "container not running",
@@ -74,7 +79,6 @@ _POSTFIX_POSTDROP_DIRS = {
     "maildrop": 0o1730,
     "public": 0o2710,
 }
-_PROMOTE_CONFLICTING_SNAPSHOT_RE = re.compile(r"conflicting snapshot '([^']+)'")
 
 
 def _lookup_unix_id(path: Path, name: str, *, field_index: int) -> int | None:
@@ -159,6 +163,15 @@ class RuncRuntimePaths:
     checkpoint_root: Path = Path("/var/lib/crab/checkpoints")
     metadata_root: Path = Path("/var/lib/crab/sandbox-metadata")
     zfs_dataset_prefix: str = "crab/sandboxes"
+    # Root of the btrfs filesystem holding sandbox subvolumes. Only
+    # consulted when RuncRuntimeOptions.filesystem_backend == "btrfs".
+    btrfs_root: Path = Path("/var/lib/crab/btrfs")
+    # Root of the overlay backend's btrfs area (per-sandbox upper/work
+    # subvolumes, shared lowers, snapshot mounts). Only consulted when
+    # filesystem_backend == "overlay"; defaults to `<btrfs_root>/overlay`
+    # so a host prepared for the btrfs backend runs overlay with zero
+    # extra setup and the two backends' namespaces never collide.
+    overlay_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +217,23 @@ class RuncRuntimeOptions:
     restore: RuncRestoreOptions = field(default_factory=RuncRestoreOptions)
     command_timeout_seconds: float = _DEFAULT_RUNTIME_COMMAND_TIMEOUT_SECONDS
     zfs_prepare_timeout_seconds: float = _DEFAULT_ZFS_PREPARE_TIMEOUT_SECONDS
+    # CoW backend for sandbox rootfs checkpoints: "zfs" (default),
+    # "btrfs", or "overlay" (overlayfs rootfs with upper/work on btrfs).
+    # Ignored when an explicit fs_provider is injected.
+    filesystem_backend: str = "zfs"
+    # Per-snapshot byte stats on btrfs/overlay require qgroups, which
+    # carry real overhead; default off (stats degrade to unknown). On
+    # overlay the stats cover the upper subvolume only.
+    btrfs_qgroups_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class _ExecScope:
+    token: str
+    pid_file: Path
+    cgroup_name: str | None = None
+    cgroup_path: Path | None = None
+    parent_cgroup_path: Path | None = None
 
 
 class RuncRuntime(Runtime):
@@ -220,18 +250,63 @@ class RuncRuntime(Runtime):
         checkpoint_options: RuncCheckpointOptions | None = None,
         restore_options: RuncRestoreOptions | None = None,
         options: RuncRuntimeOptions | None = None,
+        fs_provider: FilesystemProvider | None = None,
+        action_recorder: ActionRecorder | None = None,
     ) -> None:
         self._version = version
         resolved_options = options or RuncRuntimeOptions()
         self._paths = paths or RuncRuntimePaths()
         self._runner = command_runner or SubprocessCommandRunner(timeout_seconds=resolved_options.command_timeout_seconds)
         self._runtime_bin = runtime_bin
-        self._zfs_bin = zfs_bin
         self._host_inspector_client = host_inspector_client
         self._telemetry = telemetry or NoopTelemetrySink()
+        # Action journal sink (roadmap B1). Optional; recording failures are
+        # swallowed so journaling never breaks exec/launch.
+        self.action_recorder = action_recorder
         self._checkpoint_options = checkpoint_options or resolved_options.checkpoint
         self._restore_options = restore_options or resolved_options.restore
         self._zfs_prepare_timeout_seconds = float(resolved_options.zfs_prepare_timeout_seconds)
+        # Filesystem CoW backend. Provider commands run through this
+        # runtime's _run_command/_run_status so telemetry stays identical;
+        # dataset naming that depends on per-sandbox descriptions resolves
+        # back through dataset_name_for/rootfs_path_for.
+        if fs_provider is not None:
+            self._fs = fs_provider
+        elif resolved_options.filesystem_backend == "btrfs":
+            self._fs = BtrfsProvider(
+                btrfs_root=self._paths.btrfs_root,
+                runtime_name=self.name,
+                run_command=self._run_command,
+                run_status=self._run_status,
+                dataset_resolver=self.dataset_name_for,
+                rootfs_resolver=self.rootfs_path_for,
+                qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
+            )
+        elif resolved_options.filesystem_backend == "overlay":
+            self._fs = OverlayProvider(
+                overlay_root=self._paths.overlay_root or self._paths.btrfs_root / "overlay",
+                runtime_name=self.name,
+                run_command=self._run_command,
+                run_status=self._run_status,
+                dataset_resolver=self.dataset_name_for,
+                rootfs_resolver=self.rootfs_path_for,
+                qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
+            )
+        elif resolved_options.filesystem_backend == "zfs":
+            self._fs = ZfsProvider(
+                dataset_prefix=self._paths.zfs_dataset_prefix,
+                runtime_name=self.name,
+                run_command=self._run_command,
+                run_status=self._run_status,
+                dataset_resolver=self.dataset_name_for,
+                rootfs_resolver=self.rootfs_path_for,
+                zfs_bin=zfs_bin,
+            )
+        else:
+            raise ValueError(
+                f"unsupported filesystem_backend: {resolved_options.filesystem_backend!r} "
+                "(expected 'zfs', 'btrfs' or 'overlay')"
+            )
         self._lock = Lock()
         self._items: dict[SandboxId, SandboxDescription] = {}
         # In-flight `runc exec` subprocesses keyed by sandbox. The spot
@@ -244,7 +319,7 @@ class RuncRuntime(Runtime):
         # PR_SET_PDEATHSIG SIGKILL on the in-container exec'd process,
         # closing the socket so CRIU can dump cleanly.
         self._active_execs_lock = Lock()
-        self._active_execs: dict[SandboxId, set[subprocess.Popen]] = {}
+        self._active_execs: dict[SandboxId, dict[subprocess.Popen, _ExecScope]] = {}
         # Active `criu lazy-pages` daemons indexed by daemon PID. The CRIU
         # daemon serves userfaultfd page faults from the on-disk image set
         # for the lifetime of the restored process. If the runtime image
@@ -296,53 +371,11 @@ class RuncRuntime(Runtime):
         md = dict(metadata or {})
         bundle_path = Path(str(md["bundle_path"])) if "bundle_path" in md else self._paths.bundle_root / str(sandbox_id)
         rootfs_path = bundle_path / "rootfs"
-        dataset = str(md.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
+        dataset = str(md.get("zfs_dataset", self._fs.default_dataset_name(sandbox_id)))
         return sandbox_id, md, bundle_path, rootfs_path, dataset
 
-    def _shared_rootfs_details(self, key: str, *, persist_across_runs: bool) -> tuple[str, Path]:
-        if persist_across_runs:
-            dataset = f"{self._paths.zfs_dataset_prefix}-cache-{key}"
-        else:
-            dataset = f"{self._paths.zfs_dataset_prefix}/_shared_rootfs_{key}"
-        safe_prefix = "".join(
-            char if char.isalnum() or char in {"-", "_", "."} else "_"
-            for char in self._paths.zfs_dataset_prefix
-        )
-        scope = "persistent" if persist_across_runs else "run"
-        mountpoint = Path("/tmp/crab-rootfs-cache") / safe_prefix / scope / key
-        return dataset, mountpoint
-
     def _shared_rootfs_lock_path(self, key: str, *, persist_across_runs: bool) -> Path:
-        safe_prefix = "".join(
-            char if char.isalnum() or char in {"-", "_", "."} else "_"
-            for char in self._paths.zfs_dataset_prefix
-        )
-        scope = "persistent" if persist_across_runs else "run"
-        return Path("/tmp/crab-rootfs-cache-locks") / safe_prefix / scope / f"{key}.lock"
-
-    def _zfs_object_exists(self, name: str) -> bool:
-        result = self._run_command(
-            [self._zfs_bin, "list", "-H", "-o", "name", name],
-            operation="sandbox.zfs_list",
-            check=False,
-            metadata={"name": name},
-        )
-        return result.returncode == 0
-
-    def _destroy_dataset_by_name(
-        self,
-        dataset: str,
-        *,
-        operation: str,
-        sandbox_id: SandboxId | None = None,
-    ) -> None:
-        self._run_command(
-            [self._zfs_bin, "destroy", "-r", dataset],
-            operation=operation,
-            sandbox_id=sandbox_id,
-            check=False,
-            metadata={"dataset": dataset},
-        )
+        return self._fs.shared_rootfs_lock_path(key, persist_across_runs=persist_across_runs)
 
     def _prepare_launch_attributes(
         self,
@@ -361,6 +394,9 @@ class RuncRuntime(Runtime):
                 attributes["shared_rootfs_persist"] = bool(metadata.get(_SHARED_ROOTFS_PERSIST_METADATA_KEY, False))
             attributes["rootfs_init_dir_count"] = len(metadata.get("rootfs_init_dirs", []))
             attributes["rootfs_copy_path_count"] = len(metadata.get("rootfs_copy_paths", []))
+            attributes["rootfs_post_clone_copy_path_count"] = len(
+                metadata.get(_ROOTFS_POST_CLONE_COPY_PATHS_METADATA_KEY, [])
+            )
         if extra:
             attributes.update(extra)
         return attributes
@@ -385,18 +421,67 @@ class RuncRuntime(Runtime):
             rootfs_path.mkdir(parents=True, exist_ok=True)
             for rel in metadata.get("rootfs_init_dirs", []):
                 (rootfs_path / str(rel)).mkdir(parents=True, exist_ok=True)
-            for item in metadata.get("rootfs_copy_paths", []):
-                source = Path(str(item["source"]))
-                destination = rootfs_path / str(item["destination"]).lstrip("/")
-                if source.is_dir():
-                    shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
-                else:
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(source, destination, follow_symlinks=True)
+            self._copy_rootfs_paths(
+                rootfs_path,
+                metadata.get("rootfs_copy_paths", []),
+            )
         except Exception:
             operation.finish(status="failed")
             raise
         operation.finish(status="succeeded")
+
+    def _materialize_post_clone_rootfs(
+        self,
+        rootfs_path: Path,
+        metadata: dict[str, object],
+        *,
+        sandbox_id: SandboxId,
+    ) -> None:
+        items = metadata.get(_ROOTFS_POST_CLONE_COPY_PATHS_METADATA_KEY, [])
+        operation = start_operation(
+            self._telemetry,
+            "sandbox.rootfs_post_clone_materialize",
+            self._prepare_launch_attributes(
+                sandbox_id=sandbox_id,
+                metadata=metadata,
+                extra={"rootfs_path": str(rootfs_path)},
+            ),
+        )
+        try:
+            self._copy_rootfs_paths(rootfs_path, items)
+        except Exception:
+            operation.finish(status="failed")
+            raise
+        operation.finish(status="succeeded")
+
+    @staticmethod
+    def _copy_rootfs_paths(rootfs_path: Path, raw_items: object) -> None:
+        if not isinstance(raw_items, (list, tuple)):
+            raise ValueError("rootfs copy paths must be a list")
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise ValueError(f"invalid rootfs copy directive: {raw_item!r}")
+            if "source" not in raw_item or "destination" not in raw_item:
+                raise ValueError(f"rootfs copy directive requires source and destination: {raw_item!r}")
+            source = Path(str(raw_item["source"]))
+            destination = rootfs_path / str(raw_item["destination"]).lstrip("/")
+            if not source.exists():
+                raise FileNotFoundError(
+                    f"rootfs materialization source does not exist: {source}"
+                )
+            if bool(raw_item.get("replace", False)) and destination.exists():
+                if destination.is_dir() and not destination.is_symlink():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            elif bool(raw_item.get("replace", False)) and destination.is_symlink():
+                # `Path.exists()` is false for a dangling symlink.
+                destination.unlink()
+            if source.is_dir():
+                shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, destination, follow_symlinks=True)
 
     def _sync_clone_view_for_test_runner(self, source_rootfs_path: Path, target_rootfs_path: Path) -> None:
         if isinstance(self._runner, SubprocessCommandRunner):
@@ -425,7 +510,7 @@ class RuncRuntime(Runtime):
         persist_across_runs: bool,
         metadata: dict[str, object],
     ) -> tuple[str, Path]:
-        dataset, mountpoint = self._shared_rootfs_details(key, persist_across_runs=persist_across_runs)
+        dataset, mountpoint = self._fs.shared_rootfs_details(key, persist_across_runs=persist_across_runs)
         snapshot = f"{dataset}@{_SHARED_ROOTFS_SNAPSHOT_NAME}"
         lock_path = self._shared_rootfs_lock_path(key, persist_across_runs=persist_across_runs)
         operation = start_operation(
@@ -453,27 +538,31 @@ class RuncRuntime(Runtime):
                 ),
             )
             try:
-                dataset_exists = self._zfs_object_exists(dataset)
-                snapshot_exists = self._zfs_object_exists(snapshot)
+                dataset_exists = self._fs.object_exists(dataset)
+                snapshot_exists = self._fs.object_exists(snapshot)
                 if dataset_exists and snapshot_exists:
                     operation.finish(status="succeeded", attributes={"cache_hit": True})
                     return dataset, mountpoint
                 if dataset_exists and not snapshot_exists:
-                    self._destroy_dataset_by_name(
+                    self._fs.destroy_dataset(
                         dataset,
                         operation="sandbox.zfs_destroy_incomplete_shared_rootfs",
                     )
-                mountpoint.mkdir(parents=True, exist_ok=True)
-                self._run_command(
-                    [self._zfs_bin, "create", "-o", f"mountpoint={mountpoint}", dataset],
+                if str(mountpoint) != dataset:
+                    # btrfs uses the subvolume path itself as the
+                    # mountpoint; pre-creating it as a plain directory
+                    # would break `btrfs subvolume create`.
+                    mountpoint.mkdir(parents=True, exist_ok=True)
+                self._fs.create_dataset(
+                    dataset,
+                    mountpoint,
                     operation="sandbox.zfs_create_shared_rootfs",
-                    metadata={"dataset": dataset, "mountpoint": str(mountpoint)},
                 )
                 self._materialize_rootfs(mountpoint, metadata)
-                self._run_command(
-                    [self._zfs_bin, "snapshot", snapshot],
+                self._fs.create_snapshot(
+                    dataset,
+                    snapshot,
                     operation="sandbox.zfs_snapshot_shared_rootfs",
-                    metadata={"dataset": dataset, "snapshot": snapshot},
                 )
             except Exception:
                 operation.finish(status="failed")
@@ -486,6 +575,13 @@ class RuncRuntime(Runtime):
     def prepare_launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
         sandbox_id, md, bundle_path, rootfs_path, dataset = self._resolve_launch_request(runtime_name, metadata)
         shared_rootfs_key = str(md.get(_SHARED_ROOTFS_KEY_METADATA_KEY, "")).strip()
+        if shared_rootfs_key:
+            from integrations.sandboxes.runtime.baseline import version_shared_rootfs_key
+
+            shared_rootfs_key = version_shared_rootfs_key(shared_rootfs_key)
+            md[_SHARED_ROOTFS_KEY_METADATA_KEY] = shared_rootfs_key
+            if metadata is not None:
+                metadata[_SHARED_ROOTFS_KEY_METADATA_KEY] = shared_rootfs_key
         operation = start_operation(
             self._telemetry,
             "sandbox.runtime_prepare_launch",
@@ -521,7 +617,7 @@ class RuncRuntime(Runtime):
             bundle_path.mkdir(parents=True, exist_ok=True)
             rootfs_path.mkdir(parents=True, exist_ok=True)
             reuse_existing_rootfs = bool(md.get(_LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY, False))
-            if reuse_existing_rootfs and self._zfs_dataset_exists(dataset):
+            if reuse_existing_rootfs and self._fs.dataset_exists(dataset):
                 if metadata is not None:
                     metadata["rootfs_path"] = str(rootfs_path)
                     metadata["zfs_dataset"] = dataset
@@ -542,38 +638,39 @@ class RuncRuntime(Runtime):
                     persist_across_runs=bool(md.get(_SHARED_ROOTFS_PERSIST_METADATA_KEY, False)),
                     metadata=md,
                 )
-                self._destroy_dataset_by_name(
+                self._fs.destroy_dataset(
                     dataset,
                     operation="sandbox.zfs_destroy_stale_launch_dataset",
                     sandbox_id=sandbox_id,
                 )
                 shared_snapshot = f"{shared_dataset}@{_SHARED_ROOTFS_SNAPSHOT_NAME}"
-                self._run_command(
-                    [self._zfs_bin, "clone", "-o", f"mountpoint={rootfs_path}", shared_snapshot, dataset],
-                    operation="sandbox.zfs_clone_launch_rootfs",
+                self._fs.clone_shared_base(
+                    shared_dataset,
+                    shared_snapshot,
+                    dataset,
+                    rootfs_path,
                     sandbox_id=sandbox_id,
-                    metadata={
-                        "source_dataset": shared_dataset,
-                        "target_dataset": dataset,
-                        "snapshot": shared_snapshot,
-                        "mountpoint": str(rootfs_path),
-                    },
                 )
                 self._sync_clone_view_for_test_runner(shared_rootfs_path, rootfs_path)
             else:
-                self._destroy_dataset_by_name(
+                self._fs.destroy_dataset(
                     dataset,
                     operation="sandbox.zfs_destroy_stale_launch_dataset",
                     sandbox_id=sandbox_id,
                 )
-                self._run_command(
-                    [self._zfs_bin, "create", "-o", f"mountpoint={rootfs_path}", dataset],
+                self._fs.create_dataset(
+                    dataset,
+                    rootfs_path,
                     operation="sandbox.zfs_create",
                     sandbox_id=sandbox_id,
-                    metadata={"dataset": dataset, "mountpoint": str(rootfs_path)},
                     timeout_seconds=self._zfs_prepare_timeout_seconds,
                 )
                 self._materialize_rootfs(rootfs_path, md, sandbox_id=sandbox_id)
+            self._materialize_post_clone_rootfs(
+                rootfs_path,
+                md,
+                sandbox_id=sandbox_id,
+            )
             _repair_postfix_rootfs_permissions(rootfs_path)
             if metadata is not None:
                 metadata["rootfs_path"] = str(rootfs_path)
@@ -593,53 +690,91 @@ class RuncRuntime(Runtime):
         return sandbox_id
 
     def launch(self, runtime_name: str, metadata: dict[str, object] | None = None) -> SandboxId:
-        self.prepare_launch(runtime_name, metadata)
         sandbox_id, md, bundle_path, rootfs_path, dataset = self._resolve_launch_request(runtime_name, metadata)
-        description_metadata = {
-            key: value
-            for key, value in md.items()
-            if key not in {_LAUNCH_PREPARED_METADATA_KEY, _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY}
-        }
-        logger.info(
-            "Launching prepared runtime sandbox=%s bundle_path=%s dataset=%s",
-            sandbox_id,
-            bundle_path,
-            dataset,
-        )
-        self._run_command(
-            [self._runtime_bin, "--root", str(self._paths.state_root), "create", "--bundle", str(bundle_path), str(sandbox_id)],
-            operation="sandbox.runtime_create",
-            sandbox_id=sandbox_id,
-            metadata={"bundle_path": str(bundle_path)},
-        )
         try:
+            self.prepare_launch(runtime_name, metadata)
+            sandbox_id, md, bundle_path, rootfs_path, dataset = self._resolve_launch_request(
+                runtime_name, metadata
+            )
+            description_metadata = {
+                key: value
+                for key, value in md.items()
+                if key
+                not in {
+                    _LAUNCH_PREPARED_METADATA_KEY,
+                    _LAUNCH_REUSE_EXISTING_ROOTFS_METADATA_KEY,
+                }
+            }
+            logger.info(
+                "Launching prepared runtime sandbox=%s bundle_path=%s dataset=%s",
+                sandbox_id,
+                bundle_path,
+                dataset,
+            )
+            self._run_command(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "create", "--bundle", str(bundle_path), str(sandbox_id)],
+                operation="sandbox.runtime_create",
+                sandbox_id=sandbox_id,
+                metadata={"bundle_path": str(bundle_path)},
+            )
             self._run_command(
                 [self._runtime_bin, "--root", str(self._paths.state_root), "start", str(sandbox_id)],
                 operation="sandbox.runtime_start",
                 sandbox_id=sandbox_id,
             )
-        except Exception:
-            try:
-                self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
-            except Exception:
-                logger.exception("Failed to clean up sandbox %s after start failure", sandbox_id)
+        except Exception as exc:
+            cleanup_errors = self.cleanup_failed_launch(
+                sandbox_id,
+                bundle_path=bundle_path,
+                dataset=dataset,
+            )
+            if cleanup_errors:
+                raise SandboxCreateCleanupError(
+                    str(sandbox_id),
+                    exc,
+                    cleanup_errors,
+                    resources=(str(bundle_path), dataset),
+                ) from exc
             raise
 
-        description = SandboxDescription(
-            sandbox_id=sandbox_id,
-            runtime_name=runtime_name,
-            status="running",
-            metadata={
-                **description_metadata,
-                "bundle_path": str(bundle_path),
-                "rootfs_path": str(rootfs_path),
-                "zfs_dataset": dataset,
-            },
+        try:
+            description = SandboxDescription(
+                sandbox_id=sandbox_id,
+                runtime_name=runtime_name,
+                status="running",
+                metadata={
+                    **description_metadata,
+                    "bundle_path": str(bundle_path),
+                    "rootfs_path": str(rootfs_path),
+                    "zfs_dataset": dataset,
+                },
+            )
+            with self._lock:
+                self._items[sandbox_id] = description
+            self._persist(description)
+            self._register_with_host_inspector(description)
+        except Exception as exc:
+            # Starting runc is not the end of the create transaction. A
+            # metadata-persist or inspector-registration failure must not
+            # strand a running container that the caller was told failed.
+            cleanup_errors = self.cleanup_failed_launch(
+                sandbox_id,
+                bundle_path=bundle_path,
+                dataset=dataset,
+            )
+            if cleanup_errors:
+                raise SandboxCreateCleanupError(
+                    str(sandbox_id),
+                    exc,
+                    cleanup_errors,
+                    resources=(str(bundle_path), dataset),
+                ) from exc
+            raise
+        self._record_lifecycle_action(
+            sandbox_id,
+            "launch",
+            metadata={"runtime_name": runtime_name, "bundle_path": str(bundle_path)},
         )
-        with self._lock:
-            self._items[sandbox_id] = description
-        self._persist(description)
-        self._register_with_host_inspector(description)
         logger.info(
             "Launched runtime sandbox=%s bundle_path=%s rootfs_path=%s dataset=%s",
             sandbox_id,
@@ -649,6 +784,58 @@ class RuncRuntime(Runtime):
         )
         return sandbox_id
 
+    def cleanup_failed_launch(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        bundle_path: Path | None = None,
+        dataset: str | None = None,
+    ) -> tuple[str, ...]:
+        """Best-effort, complete cleanup for a failed create transaction."""
+
+        errors: list[str] = []
+        resolved_bundle = bundle_path or self.bundle_path_for(sandbox_id)
+        try:
+            self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
+        except Exception as exc:
+            errors.append(f"runtime state: {exc}")
+        try:
+            resolved_dataset = dataset or self.dataset_name_for(sandbox_id)
+            self._fs.destroy_filesystem_dataset(sandbox_id, resolved_dataset)
+        except Exception as exc:
+            errors.append(
+                f"filesystem dataset {dataset or self.dataset_name_for(sandbox_id)}: {exc}"
+            )
+        metadata_path = self._metadata_path(sandbox_id)
+        try:
+            metadata_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            errors.append(f"runtime metadata {metadata_path}: {exc}")
+        with self._lock:
+            self._items.pop(sandbox_id, None)
+        if self._host_inspector_client is not None:
+            try:
+                self._host_inspector_client.unregister_sandbox(sandbox_id)
+            except Exception as exc:
+                errors.append(f"host inspector registration: {exc}")
+        try:
+            if resolved_bundle.exists():
+                shutil.rmtree(resolved_bundle)
+        except Exception as exc:
+            errors.append(f"bundle {resolved_bundle}: {exc}")
+        return tuple(errors)
+
+    # Graceful-stop escalation: `stop` sends SIGTERM, then escalates to SIGKILL
+    # if the container is still running after the grace window. The sandbox init
+    # runs as PID 1 (e.g. `sleep infinity`); in a PID namespace the kernel drops
+    # default-action signals delivered to PID 1 unless the process installed a
+    # handler, so SIGTERM alone never stops these containers (docker-stop uses
+    # the same TERM-then-KILL pattern).
+    _STOP_GRACE_S = 2.0
+    _STOP_POLL_INTERVAL_S = 0.1
+
     def stop(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
         self._run_command(
@@ -656,7 +843,26 @@ class RuncRuntime(Runtime):
             operation="sandbox.runtime_kill",
             sandbox_id=sandbox_id,
         )
+        if not self._wait_for_stopped(sandbox_id, self._STOP_GRACE_S):
+            self._run_command(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "kill", str(sandbox_id), "KILL"],
+                operation="sandbox.runtime_kill_force",
+                sandbox_id=sandbox_id,
+                check=False,
+            )
         self._update_description(replace(description, status="stopped"))
+
+    def _wait_for_stopped(self, sandbox_id: SandboxId, timeout_s: float) -> bool:
+        """Poll until the container reports a terminal state, or the grace
+        window elapses. Returns True when the container is stopped/exited."""
+        deadline = time.monotonic() + max(float(timeout_s), 0.0)
+        while True:
+            state = self.inspect_runtime(sandbox_id)
+            if state.status.lower() in ("stopped", "exited", "missing"):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(self._STOP_POLL_INTERVAL_S)
 
     def pause(self, sandbox_id: SandboxId) -> None:
         description = self.describe(sandbox_id)
@@ -730,6 +936,58 @@ class RuncRuntime(Runtime):
             raise
         self._update_description(replace(description, status="running"))
 
+    def start(self, sandbox_id: SandboxId) -> None:
+        """Re-launch a stopped sandbox from its existing bundle/rootfs.
+
+        The bundle (config.json) and ZFS filesystem dataset persist across
+        ``stop``; this clears the stale runc container state and re-runs
+        ``runc create`` + ``runc start`` against the same bundle. The sandbox
+        boots with the same filesystem but a fresh process tree (analogous to
+        ``docker start`` on a stopped container). Process state from before the
+        stop is gone — use checkpoint/restore to preserve it."""
+        description = self.describe(sandbox_id)
+        bundle_path = self.bundle_path_for(sandbox_id)
+        self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
+        self._run_command(
+            [self._runtime_bin, "--root", str(self._paths.state_root), "create", "--bundle", str(bundle_path), str(sandbox_id)],
+            operation="sandbox.runtime_create",
+            sandbox_id=sandbox_id,
+            metadata={"bundle_path": str(bundle_path)},
+        )
+        try:
+            self._run_command(
+                [self._runtime_bin, "--root", str(self._paths.state_root), "start", str(sandbox_id)],
+                operation="sandbox.runtime_start",
+                sandbox_id=sandbox_id,
+            )
+        except Exception:
+            try:
+                self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
+            except Exception:
+                logger.exception("Failed to clean up sandbox %s after start failure", sandbox_id)
+            raise
+        started = replace(description, status="running")
+        with self._lock:
+            self._items[sandbox_id] = started
+        self._persist(started)
+        self._register_with_host_inspector(started)
+        self._record_lifecycle_action(
+            sandbox_id,
+            "start",
+            metadata={"bundle_path": str(bundle_path)},
+        )
+
+    def restart(self, sandbox_id: SandboxId) -> None:
+        """Stop then start the sandbox. Thaws a paused sandbox first so the
+        stop signal can be delivered; the stop is tolerated when the sandbox is
+        already stopped (start's forced delete_runtime clears any remainder)."""
+        self.resume(sandbox_id)
+        try:
+            self.stop(sandbox_id)
+        except RuntimeError:
+            logger.debug("restart: stop raised (likely already stopped); proceeding to start sandbox=%s", sandbox_id)
+        self.start(sandbox_id)
+
     _DEFENSIVE_RESUME_RETRY_DELAYS_S = (0.0, 5.0)
     _DEFENSIVE_RESUME_BENIGN_ERRORS = (
         "container not paused",
@@ -786,6 +1044,24 @@ class RuncRuntime(Runtime):
         description = self.describe(sandbox_id)
         self._update_description(replace(description, status="running" if is_running else "stopped"))
 
+    def adopt_sandbox_description(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        runtime_name: str,
+        status: str,
+        metadata: dict[str, object],
+    ) -> None:
+        description = SandboxDescription(
+            sandbox_id=sandbox_id,
+            runtime_name=runtime_name,
+            status=status,
+            metadata=dict(metadata),
+        )
+        with self._lock:
+            self._items[sandbox_id] = description
+        self._persist(description)
+
     def prepare_for_restore(self, sandbox_id: SandboxId) -> None:
         self.delete_runtime(sandbox_id, force=True, ignore_missing=True)
 
@@ -808,6 +1084,35 @@ class RuncRuntime(Runtime):
                 self._host_inspector_client.unregister_sandbox(sandbox_id)
             except Exception:
                 logger.exception("Failed to unregister sandbox %s from host inspector", sandbox_id)
+
+    def update_network_metadata(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        guest_ip: str,
+        network_namespace_path: str,
+    ) -> None:
+        """Re-point an already-launched sandbox's network metadata.
+
+        Launch metadata is written once by the SDK from the sandbox's network
+        lease and is otherwise immutable. Promotion breaks that assumption:
+        the source identity adopts the fork's lease, so the address recorded
+        at launch becomes dead. Two readers depend on it — the engine's
+        interceptor attribution fallback and `Sandbox.get_host` — so the
+        metadata is part of the identity swap, not cosmetic.
+
+        Missing sandboxes are ignored: the caller is mid-swap and a sandbox
+        without a description has no metadata to correct.
+        """
+        with self._lock:
+            description = self._items.get(sandbox_id)
+        if description is None:
+            return
+        new_metadata = dict(description.metadata)
+        new_metadata["guest_ip"] = guest_ip
+        new_metadata["network_namespace_path"] = network_namespace_path
+        new_metadata["network_mode"] = "isolated"
+        self._update_description(replace(description, metadata=new_metadata))
 
     def update_host_inspector_filters(
         self,
@@ -932,6 +1237,457 @@ class RuncRuntime(Runtime):
             metadata={"payload": payload, "stdout": result.stdout.strip(), "stderr": result.stderr.strip()},
         )
 
+    def _prepare_exec_scope(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        timeout_s: float | None,
+    ) -> _ExecScope:
+        token = uuid.uuid4().hex
+        exec_state_dir = self.bundle_path_for(sandbox_id) / ".crab-exec"
+        exec_state_dir.mkdir(parents=True, exist_ok=True)
+        pid_file = exec_state_dir / f"{token}.pid"
+
+        # A dedicated child cgroup is required for a hard timeout boundary,
+        # but it also changes bpf_get_current_cgroup_id(): ordinary exec
+        # filesystem events would no longer be attributed to the sandbox's
+        # registered parent cgroup.  Keep untimed execs in the parent and use
+        # the pid-file process-tree fallback for exceptional cancellation.
+        if timeout_s is None:
+            return _ExecScope(token=token, pid_file=pid_file)
+
+        cgroup_root = Path("/sys/fs/cgroup")
+        cgroup_v2 = (cgroup_root / "cgroup.controllers").is_file()
+        parent = self._container_cgroup_path(sandbox_id) if cgroup_v2 else None
+        require_cgroup = timeout_s is not None and isinstance(
+            self._runner, SubprocessCommandRunner
+        )
+        if parent is None:
+            if require_cgroup:
+                raise SandboxExecCleanupError(
+                    "cannot enforce sandbox exec timeout: the container cgroup could not be resolved",
+                    cmd=(self._runtime_bin, "exec", str(sandbox_id)),
+                    timeout=timeout_s,
+                )
+            return _ExecScope(token=token, pid_file=pid_file)
+
+        cgroup_name = f"exec-{token}"
+        cgroup_path = parent / cgroup_name
+        try:
+            cgroup_path.mkdir(mode=0o755)
+        except OSError as exc:
+            if require_cgroup:
+                raise SandboxExecCleanupError(
+                    f"cannot create isolated exec cgroup {cgroup_path}: {exc}",
+                    cmd=(self._runtime_bin, "exec", str(sandbox_id)),
+                    timeout=timeout_s,
+                    cgroup_path=str(cgroup_path),
+                ) from exc
+            logger.debug(
+                "Per-exec cgroup unavailable for sandbox=%s path=%s",
+                sandbox_id,
+                cgroup_path,
+                exc_info=True,
+            )
+            return _ExecScope(token=token, pid_file=pid_file)
+        return _ExecScope(
+            token=token,
+            pid_file=pid_file,
+            cgroup_name=cgroup_name,
+            cgroup_path=cgroup_path,
+            parent_cgroup_path=parent,
+        )
+
+    def _container_cgroup_path(self, sandbox_id: SandboxId) -> Path | None:
+        cgroup_root = Path("/sys/fs/cgroup")
+        config_path = self.bundle_path_for(sandbox_id) / "config.json"
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            cgroups_path = (payload.get("linux") or {}).get("cgroupsPath")
+        except (FileNotFoundError, json.JSONDecodeError, AttributeError):
+            cgroups_path = None
+        if isinstance(cgroups_path, str) and cgroups_path and ":" not in cgroups_path:
+            candidate = cgroup_root / cgroups_path.lstrip("/")
+            if candidate.is_dir():
+                return candidate
+
+        # A systemd-style cgroupsPath is not a literal filesystem path.  The
+        # live init PID is authoritative for both that form and any runtime
+        # normalization performed by runc.
+        try:
+            state = self.inspect_runtime(sandbox_id)
+            init_pid = state.pid
+        except Exception:
+            init_pid = None
+        if init_pid is None:
+            return None
+        try:
+            for line in Path(f"/proc/{init_pid}/cgroup").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                fields = line.split(":", 2)
+                if len(fields) == 3 and fields[0] == "0":
+                    candidate = cgroup_root / fields[2].lstrip("/")
+                    if candidate.is_dir():
+                        return candidate
+        except OSError:
+            return None
+        return None
+
+    @staticmethod
+    def _exec_scope_payload_pid(scope: _ExecScope) -> int | None:
+        try:
+            value = int(scope.pid_file.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    @staticmethod
+    def _cgroup_pids(cgroup_path: Path | None) -> list[int]:
+        if cgroup_path is None:
+            return []
+        try:
+            raw = (cgroup_path / "cgroup.procs").read_text(encoding="utf-8")
+        except (FileNotFoundError, OSError):
+            return []
+        pids: list[int] = []
+        for item in raw.split():
+            try:
+                pid = int(item)
+            except ValueError:
+                continue
+            if pid > 0:
+                pids.append(pid)
+        return pids
+
+    @classmethod
+    def _wait_cgroup_empty(cls, cgroup_path: Path | None, timeout_s: float) -> bool:
+        if cgroup_path is None or not cgroup_path.exists():
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            if not cls._cgroup_pids(cgroup_path):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    @staticmethod
+    def _signal_pids(pids: list[int], sig: int) -> None:
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                continue
+
+    @staticmethod
+    def _wait_pids_gone(pids: set[int], timeout_s: float) -> list[int]:
+        """Wait for process-table entries, including zombies, to disappear."""
+
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while True:
+            remaining = [pid for pid in pids if Path(f"/proc/{pid}").exists()]
+            if not remaining or time.monotonic() >= deadline:
+                return remaining
+            time.sleep(0.02)
+
+    @classmethod
+    def _descendant_pids(cls, root_pid: int) -> list[int]:
+        pending = [root_pid]
+        seen: set[int] = set()
+        while pending:
+            pid = pending.pop()
+            if pid <= 0 or pid in seen:
+                continue
+            seen.add(pid)
+            task_root = Path(f"/proc/{pid}/task")
+            try:
+                task_dirs = list(task_root.iterdir())
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            for task_dir in task_dirs:
+                try:
+                    children = (task_dir / "children").read_text(
+                        encoding="utf-8"
+                    )
+                except (FileNotFoundError, PermissionError, OSError):
+                    continue
+                for raw_child in children.split():
+                    try:
+                        pending.append(int(raw_child))
+                    except ValueError:
+                        continue
+        return list(seen)
+
+    def _terminate_exec_payload(self, scope: _ExecScope, *, grace_s: float = 2.0) -> None:
+        if scope.cgroup_path is not None:
+            payload_pid = self._exec_scope_payload_pid(scope)
+            observed_pids = set(self._cgroup_pids(scope.cgroup_path))
+
+            # Terminate descendants before the payload root. For the common
+            # `sh -c 'child & wait'` shape this lets the waiting shell reap
+            # its child and exit naturally. Killing both at once reparents a
+            # zombie to the sandbox's intentionally minimal PID 1
+            # (`sleep infinity`), which cannot reap it.
+            child_deadline = time.monotonic() + min(0.25, max(0.0, grace_s))
+            while True:
+                current = self._cgroup_pids(scope.cgroup_path)
+                observed_pids.update(current)
+                children = [pid for pid in current if pid != payload_pid]
+                if not children or time.monotonic() >= child_deadline:
+                    break
+                self._signal_pids(children, signal.SIGTERM)
+                time.sleep(0.02)
+
+            child_kill_deadline = time.monotonic() + min(
+                0.25, max(0.0, grace_s)
+            )
+            while True:
+                current = self._cgroup_pids(scope.cgroup_path)
+                observed_pids.update(current)
+                children = [pid for pid in current if pid != payload_pid]
+                if not children or time.monotonic() >= child_kill_deadline:
+                    break
+                self._signal_pids(children, signal.SIGKILL)
+                time.sleep(0.02)
+
+            # Give a waiting root a moment to observe SIGCHLD, reap, and
+            # finish before signaling whatever remains.
+            if not self._wait_cgroup_empty(
+                scope.cgroup_path, min(0.10, max(0.0, grace_s))
+            ):
+                current = self._cgroup_pids(scope.cgroup_path)
+                observed_pids.update(current)
+                self._signal_pids(current, signal.SIGTERM)
+
+            if not self._wait_cgroup_empty(scope.cgroup_path, min(0.25, grace_s)):
+                kill_file = scope.cgroup_path / "cgroup.kill"
+                try:
+                    kill_file.write_text("1", encoding="ascii")
+                except (FileNotFoundError, OSError):
+                    # Older cgroup-v2 kernels may lack cgroup.kill. Re-scan
+                    # until empty so processes that forked after SIGTERM are
+                    # included in the SIGKILL pass.
+                    deadline = time.monotonic() + max(0.0, grace_s)
+                    while self._cgroup_pids(scope.cgroup_path):
+                        self._signal_pids(
+                            self._cgroup_pids(scope.cgroup_path), signal.SIGKILL
+                        )
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.02)
+            if not self._wait_cgroup_empty(scope.cgroup_path, grace_s):
+                raise RuntimeError(
+                    f"exec cgroup remained populated: {scope.cgroup_path} "
+                    f"pids={self._cgroup_pids(scope.cgroup_path)}"
+                )
+            remaining_process_entries = self._wait_pids_gone(
+                observed_pids, grace_s
+            )
+            if remaining_process_entries:
+                raise RuntimeError(
+                    "exec descendants remained in the process table after "
+                    f"cgroup drain: pids={remaining_process_entries}"
+                )
+            return
+
+        # Non-production fallback for runtimes without cgroup v2. Production
+        # timeout calls refuse to launch without a dedicated cgroup above.
+        payload_pid = self._exec_scope_payload_pid(scope)
+        if payload_pid is None:
+            raise RuntimeError("runc did not publish the exec payload PID")
+        descendants = self._descendant_pids(payload_pid)
+        self._signal_pids(list(reversed(descendants)), signal.SIGTERM)
+        deadline = time.monotonic() + min(0.25, max(0.0, grace_s))
+        while time.monotonic() < deadline and self._descendant_pids(payload_pid):
+            time.sleep(0.02)
+        descendants = self._descendant_pids(payload_pid)
+        self._signal_pids(list(reversed(descendants)), signal.SIGKILL)
+        deadline = time.monotonic() + max(0.0, grace_s)
+        while time.monotonic() < deadline:
+            if not self._descendant_pids(payload_pid):
+                return
+            time.sleep(0.02)
+        if self._descendant_pids(payload_pid):
+            raise RuntimeError(
+                f"exec payload tree remained alive: root_pid={payload_pid}"
+            )
+
+    def _release_successful_exec_scope(self, scope: _ExecScope) -> None:
+        """Move intentionally detached descendants to the container cgroup."""
+
+        try:
+            if scope.cgroup_path is not None and scope.parent_cgroup_path is not None:
+                deadline = time.monotonic() + 1.0
+                while True:
+                    pids = self._cgroup_pids(scope.cgroup_path)
+                    if not pids:
+                        break
+                    for pid in pids:
+                        try:
+                            (scope.parent_cgroup_path / "cgroup.procs").write_text(
+                                str(pid), encoding="ascii"
+                            )
+                        except ProcessLookupError:
+                            continue
+                        except OSError:
+                            logger.warning(
+                                "Failed to migrate detached exec descendant sandbox_cgroup=%s "
+                                "exec_cgroup=%s pid=%d",
+                                scope.parent_cgroup_path,
+                                scope.cgroup_path,
+                                pid,
+                                exc_info=True,
+                            )
+                            return
+                    if time.monotonic() >= deadline:
+                        logger.warning(
+                            "Detached exec descendants kept transient cgroup=%s pids=%s",
+                            scope.cgroup_path,
+                            self._cgroup_pids(scope.cgroup_path),
+                        )
+                        return
+                    time.sleep(0.01)
+        finally:
+            self._remove_exec_scope_artifacts(scope)
+
+    def _mark_isolated_exec_filesystem_changed(
+        self,
+        sandbox_id: SandboxId,
+        scope: _ExecScope,
+    ) -> None:
+        """Prevent a child-cgroup exec from producing a false-clean signal."""
+
+        if scope.cgroup_path is None or self._host_inspector_client is None:
+            return
+        try:
+            self._host_inspector_client.mark_filesystem_changed(
+                sandbox_id,
+                reason="timeout-isolated exec used an unregistered child cgroup",
+            )
+        except Exception:
+            # Inspector integration is advisory for execution.  Keep the
+            # command result intact, but make the loss of conservative dirty
+            # tracking operationally visible.
+            logger.warning(
+                "Failed to invalidate host-inspector filesystem baseline "
+                "after isolated exec sandbox=%s cgroup=%s",
+                sandbox_id,
+                scope.cgroup_path,
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _remove_exec_scope_artifacts(scope: _ExecScope) -> None:
+        try:
+            scope.pid_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logger.debug("Failed to remove exec pid file %s", scope.pid_file, exc_info=True)
+        if scope.cgroup_path is not None:
+            try:
+                scope.cgroup_path.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # A successful detached command may still be racing through
+                # migration. Leaving an empty named cgroup is safer than
+                # killing a user-requested background process.
+                logger.debug(
+                    "Failed to remove exec cgroup %s",
+                    scope.cgroup_path,
+                    exc_info=True,
+                )
+        try:
+            scope.pid_file.parent.rmdir()
+        except OSError:
+            pass
+
+    def _abort_exec_process(
+        self,
+        proc: subprocess.Popen,
+        scope: _ExecScope,
+        *,
+        command: list[str],
+        timeout_s: float | None,
+    ) -> tuple[object, object, SandboxExecCleanupError | None]:
+        cleanup_failure: Exception | None = None
+        try:
+            self._terminate_exec_payload(scope)
+        except Exception as exc:
+            cleanup_failure = exc
+
+        try:
+            stdout, stderr = proc.communicate(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.terminate()
+                stdout, stderr = proc.communicate(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+            except Exception as exc:
+                stdout, stderr = None, None
+                cleanup_failure = cleanup_failure or exc
+        except Exception as exc:
+            stdout, stderr = None, None
+            cleanup_failure = cleanup_failure or exc
+
+        if scope.cgroup_path is not None and not self._wait_cgroup_empty(
+            scope.cgroup_path, 0.5
+        ):
+            cleanup_failure = cleanup_failure or RuntimeError(
+                f"exec cgroup remained populated: {scope.cgroup_path} "
+                f"pids={self._cgroup_pids(scope.cgroup_path)}"
+            )
+        payload_pid = self._exec_scope_payload_pid(scope)
+        self._remove_exec_scope_artifacts(scope)
+        if cleanup_failure is None:
+            return stdout, stderr, None
+        return (
+            stdout,
+            stderr,
+            SandboxExecCleanupError(
+                f"sandbox exec timed out but payload cleanup failed: {cleanup_failure}",
+                cmd=command,
+                timeout=timeout_s,
+                stdout=self._output_text(stdout),
+                stderr=self._output_text(stderr),
+                payload_pid=payload_pid,
+                cgroup_path=None if scope.cgroup_path is None else str(scope.cgroup_path),
+            ),
+        )
+
+    @staticmethod
+    def _output_text(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+        return str(value)
+
+    def _register_active_exec(
+        self,
+        sandbox_id: SandboxId,
+        proc: subprocess.Popen,
+        scope: _ExecScope,
+    ) -> None:
+        with self._active_execs_lock:
+            self._active_execs.setdefault(sandbox_id, {})[proc] = scope
+
+    def _unregister_active_exec(
+        self,
+        sandbox_id: SandboxId,
+        proc: subprocess.Popen,
+    ) -> None:
+        with self._active_execs_lock:
+            bucket = self._active_execs.get(sandbox_id)
+            if bucket is not None:
+                bucket.pop(proc, None)
+                if not bucket:
+                    self._active_execs.pop(sandbox_id, None)
+
     def exec(
         self,
         sandbox_id: SandboxId,
@@ -943,6 +1699,7 @@ class RuncRuntime(Runtime):
         timeout_s: float | None = None,
         capture_output: bool = True,
     ) -> SandboxExecResult:
+        scope = self._prepare_exec_scope(sandbox_id, timeout_s=timeout_s)
         command = [self._runtime_bin, "--root", str(self._paths.state_root), "exec"]
         if cwd:
             command.extend(["--cwd", cwd])
@@ -950,9 +1707,13 @@ class RuncRuntime(Runtime):
             command.extend(["--user", user])
         for key, value in sorted((env or {}).items()):
             command.extend(["--env", f"{key}={value}"])
+        command.extend(["--pid-file", str(scope.pid_file)])
+        if scope.cgroup_name is not None:
+            command.extend(["--cgroup", scope.cgroup_name])
         command.append(str(sandbox_id))
         command.extend(argv)
         started = time.perf_counter()
+        started_at_iso = utc_now().isoformat()
         stdout_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         stderr_target = subprocess.PIPE if capture_output else subprocess.DEVNULL
         operation_context = start_operation(
@@ -970,34 +1731,97 @@ class RuncRuntime(Runtime):
                 },
             ),
         )
-        proc = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_target,
-            stderr=stderr_target,
-            text=True,
-        )
-        with self._active_execs_lock:
-            self._active_execs.setdefault(sandbox_id, set()).add(proc)
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_target,
+                stderr=stderr_target,
+                text=True,
+            )
+        except Exception:
+            self._remove_exec_scope_artifacts(scope)
+            operation_context.finish(status="failed")
+            raise
+        self._register_active_exec(sandbox_id, proc, scope)
+        scope_finalized = False
         try:
             try:
                 stdout, stderr = proc.communicate(timeout=timeout_s)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-                raise
+                stdout, stderr, cleanup_error = self._abort_exec_process(
+                    proc,
+                    scope,
+                    command=command,
+                    timeout_s=timeout_s,
+                )
+                scope_finalized = True
+                stdout_text = self._output_text(stdout)
+                stderr_text = self._output_text(stderr)
+                self._record_exec_action(
+                    sandbox_id,
+                    argv=argv,
+                    cwd=cwd,
+                    env=env,
+                    user=user,
+                    timeout_s=timeout_s,
+                    capture_output=capture_output,
+                    returncode=None,
+                    duration_ms=(time.perf_counter() - started) * 1000.0,
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                    started_at=started_at_iso,
+                    timed_out=True,
+                )
+                operation_context.finish(
+                    status="failed",
+                    attributes={
+                        "success": False,
+                        "timed_out": True,
+                        "cleanup_failed": cleanup_error is not None,
+                    },
+                )
+                if cleanup_error is not None:
+                    raise cleanup_error
+                raise SandboxExecTimeout(
+                    command,
+                    float(timeout_s or 0.0),
+                    stdout=stdout_text,
+                    stderr=stderr_text,
+                ) from None
         finally:
-            with self._active_execs_lock:
-                bucket = self._active_execs.get(sandbox_id)
-                if bucket is not None:
-                    bucket.discard(proc)
-                    if not bucket:
-                        self._active_execs.pop(sandbox_id, None)
+            self._unregister_active_exec(sandbox_id, proc)
+            if not scope_finalized:
+                if proc.poll() is None:
+                    self._abort_exec_process(
+                        proc,
+                        scope,
+                        command=command,
+                        timeout_s=timeout_s,
+                    )
+                else:
+                    self._release_successful_exec_scope(scope)
+                scope_finalized = True
+            self._mark_isolated_exec_filesystem_changed(sandbox_id, scope)
         duration_ms = (time.perf_counter() - started) * 1000.0
         completed = subprocess.CompletedProcess(command, proc.returncode, stdout, stderr)
         stdout = "" if completed.stdout is None else completed.stdout
         stderr = "" if completed.stderr is None else completed.stderr
         success = completed.returncode == 0
+        self._record_exec_action(
+            sandbox_id,
+            argv=argv,
+            cwd=cwd,
+            env=env,
+            user=user,
+            timeout_s=timeout_s,
+            capture_output=capture_output,
+            returncode=int(completed.returncode),
+            duration_ms=duration_ms,
+            stdout=stdout,
+            stderr=stderr,
+            started_at=started_at_iso,
+        )
         operation_context.finish(
             status="succeeded" if success else "failed",
             attributes=self._command_finish_attributes(
@@ -1048,6 +1872,253 @@ class RuncRuntime(Runtime):
         )
         return SandboxExecResult(args=tuple(command), returncode=int(completed.returncode), stdout=stdout, stderr=stderr)
 
+    def stream_exec(
+        self,
+        sandbox_id: SandboxId,
+        argv: list[str],
+        *,
+        cwd: str | None = None,
+        env: dict[str, object] | None = None,
+        user: str | None = None,
+        timeout_s: float | None = None,
+        capture_output: bool = True,
+    ) -> Iterator[tuple[str, str]]:
+        """Streaming exec: yields (channel, text) tuples as output arrives.
+
+        channel is one of 'stdout', 'stderr', or 'exit'. The final yield
+        is always ('exit', str(returncode)).
+
+        When ``capture_output`` is False (detach), stdout/stderr are wired
+        to ``/dev/null`` so a ``&``-backgrounded child cannot hold the exec
+        pipe open; no output events are produced and only the final
+        ('exit', rc) tuple is yielded once the foreground process exits.
+        """
+        scope = self._prepare_exec_scope(sandbox_id, timeout_s=timeout_s)
+        command = [self._runtime_bin, "--root", str(self._paths.state_root), "exec"]
+        if cwd:
+            command.extend(["--cwd", cwd])
+        if user:
+            command.extend(["--user", user])
+        for key, value in sorted((env or {}).items()):
+            command.extend(["--env", f"{key}={value}"])
+        command.extend(["--pid-file", str(scope.pid_file)])
+        if scope.cgroup_name is not None:
+            command.extend(["--cgroup", scope.cgroup_name])
+        command.append(str(sandbox_id))
+        command.extend(argv)
+
+        deadline = (time.monotonic() + timeout_s) if timeout_s else None
+        if not capture_output:
+            try:
+                proc = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                self._remove_exec_scope_artifacts(scope)
+                raise
+            self._register_active_exec(sandbox_id, proc, scope)
+            scope_finalized = False
+            try:
+                timeout_remaining = (deadline - time.monotonic()) if deadline else None
+                try:
+                    proc.wait(timeout=timeout_remaining)
+                except subprocess.TimeoutExpired:
+                    _, _, cleanup_error = self._abort_exec_process(
+                        proc,
+                        scope,
+                        command=command,
+                        timeout_s=timeout_s,
+                    )
+                    scope_finalized = True
+                    if cleanup_error is not None:
+                        raise cleanup_error
+                    raise SandboxExecTimeout(
+                        command,
+                        float(timeout_s or 0.0),
+                    ) from None
+                self._release_successful_exec_scope(scope)
+                scope_finalized = True
+                yield ("exit", str(proc.returncode))
+                return
+            finally:
+                self._unregister_active_exec(sandbox_id, proc)
+                if not scope_finalized:
+                    if proc.poll() is None:
+                        _, _, cleanup_error = self._abort_exec_process(
+                            proc,
+                            scope,
+                            command=command,
+                            timeout_s=timeout_s,
+                        )
+                        if cleanup_error is not None:
+                            logger.error("Streaming exec disconnect cleanup failed: %s", cleanup_error)
+                    else:
+                        self._release_successful_exec_scope(scope)
+                self._mark_isolated_exec_filesystem_changed(sandbox_id, scope)
+        try:
+            proc = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except Exception:
+            self._remove_exec_scope_artifacts(scope)
+            raise
+        self._register_active_exec(sandbox_id, proc, scope)
+        sel = selectors.DefaultSelector()
+        scope_finalized = False
+        captured: dict[str, list[str]] = {"stdout": [], "stderr": []}
+        try:
+            # Set stdout/stderr to non-blocking
+            os.set_blocking(proc.stdout.fileno(), False)
+            os.set_blocking(proc.stderr.fileno(), False)
+            sel.register(proc.stdout, selectors.EVENT_READ, "stdout")
+            sel.register(proc.stderr, selectors.EVENT_READ, "stderr")
+            open_count = 2
+            while open_count > 0:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        stdout_tail, stderr_tail, cleanup_error = self._abort_exec_process(
+                            proc,
+                            scope,
+                            command=command,
+                            timeout_s=timeout_s,
+                        )
+                        scope_finalized = True
+                        for channel, tail in (
+                            ("stdout", self._output_text(stdout_tail)),
+                            ("stderr", self._output_text(stderr_tail)),
+                        ):
+                            if tail:
+                                captured[channel].append(tail)
+                                yield (channel, tail)
+                        if cleanup_error is not None:
+                            raise cleanup_error
+                        raise SandboxExecTimeout(
+                            command,
+                            float(timeout_s or 0.0),
+                            stdout="".join(captured["stdout"]),
+                            stderr="".join(captured["stderr"]),
+                        ) from None
+                else:
+                    remaining = None
+                events = sel.select(timeout=remaining)
+                if not events:
+                    # select timed out
+                    stdout_tail, stderr_tail, cleanup_error = self._abort_exec_process(
+                        proc,
+                        scope,
+                        command=command,
+                        timeout_s=timeout_s,
+                    )
+                    scope_finalized = True
+                    for channel, tail in (
+                        ("stdout", self._output_text(stdout_tail)),
+                        ("stderr", self._output_text(stderr_tail)),
+                    ):
+                        if tail:
+                            captured[channel].append(tail)
+                            yield (channel, tail)
+                    if cleanup_error is not None:
+                        raise cleanup_error
+                    raise SandboxExecTimeout(
+                        command,
+                        float(timeout_s or 0.0),
+                        stdout="".join(captured["stdout"]),
+                        stderr="".join(captured["stderr"]),
+                    ) from None
+                for key, _ in events:
+                    data = key.fileobj.read(65536)  # type: ignore[union-attr]
+                    if not data:
+                        sel.unregister(key.fileobj)
+                        open_count -= 1
+                        continue
+                    channel = key.data
+                    text = data.decode("utf-8", errors="replace")
+                    captured[channel].append(text)
+                    yield (channel, text)
+            proc.wait()
+            self._release_successful_exec_scope(scope)
+            scope_finalized = True
+            yield ("exit", str(proc.returncode))
+        finally:
+            sel.close()
+            self._unregister_active_exec(sandbox_id, proc)
+            if not scope_finalized:
+                if proc.poll() is None:
+                    _, _, cleanup_error = self._abort_exec_process(
+                        proc,
+                        scope,
+                        command=command,
+                        timeout_s=timeout_s,
+                    )
+                    if cleanup_error is not None:
+                        logger.error("Streaming exec disconnect cleanup failed: %s", cleanup_error)
+                else:
+                    self._release_successful_exec_scope(scope)
+            self._mark_isolated_exec_filesystem_changed(sandbox_id, scope)
+
+    def _record_exec_action(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, object] | None,
+        user: str | None,
+        timeout_s: float | None,
+        capture_output: bool,
+        returncode: int | None,
+        duration_ms: float,
+        stdout: str | None,
+        stderr: str | None,
+        started_at: str,
+        timed_out: bool = False,
+    ) -> None:
+        """Best-effort action-journal record; never breaks exec."""
+        recorder = self.action_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.record_exec(
+                sandbox_id,
+                argv=argv,
+                cwd=cwd,
+                env=env,
+                user=user,
+                timeout_s=timeout_s,
+                capture_output=capture_output,
+                returncode=returncode,
+                duration_ms=duration_ms,
+                stdout=stdout,
+                stderr=stderr,
+                started_at=started_at,
+                finished_at=utc_now().isoformat(),
+                timed_out=timed_out,
+            )
+        except Exception:
+            logger.exception("Action journal record_exec failed for %s", sandbox_id)
+
+    def _record_lifecycle_action(
+        self,
+        sandbox_id: SandboxId,
+        event: str,
+        *,
+        metadata: dict[str, object] | None = None,
+    ) -> None:
+        recorder = self.action_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.record_lifecycle(sandbox_id, event, metadata=metadata)
+        except Exception:
+            logger.exception("Action journal record_lifecycle failed for %s", sandbox_id)
+
     def cancel_active_execs(self, sandbox_id: SandboxId, *, timeout_s: float = 2.0) -> int:
         """Terminate all in-flight `runc exec` subprocesses targeting
         `sandbox_id`. Returns the count of subprocesses signaled.
@@ -1055,20 +2126,29 @@ class RuncRuntime(Runtime):
         Used by the spot preemption flow so CRIU can dump the container
         without hitting the half-stream unix-socket abort caused by
         runc-exec stdio sockets crossing the container boundary.
-        Killing the host runc subprocess fires PR_SET_PDEATHSIG SIGKILL
-        on the in-container exec'd process, which closes the socket from
-        the in-container side and lets CRIU complete the dump."""
+        Timeout-isolated exec payloads have their own cgroup; untimed ones use
+        the pid-file process tree. Drain the available scope first so
+        descendants cannot outlive the host-side runc client, then terminate
+        the client to close its stdio sockets before CRIU runs."""
         with self._active_execs_lock:
-            procs = list(self._active_execs.get(sandbox_id, ()))
-        if not procs:
+            entries = list(self._active_execs.get(sandbox_id, {}).items())
+        if not entries:
             return 0
-        for proc in procs:
+        for proc, scope in entries:
+            try:
+                self._terminate_exec_payload(scope, grace_s=timeout_s)
+            except Exception:
+                logger.exception(
+                    "Failed to drain active exec payload sandbox=%s cgroup=%s",
+                    sandbox_id,
+                    scope.cgroup_path,
+                )
             try:
                 proc.terminate()
             except Exception:
                 pass
         deadline = time.monotonic() + max(0.0, float(timeout_s))
-        for proc in procs:
+        for proc, _scope in entries:
             remaining = max(0.0, deadline - time.monotonic())
             try:
                 proc.wait(timeout=remaining if remaining > 0 else 0.05)
@@ -1080,7 +2160,7 @@ class RuncRuntime(Runtime):
                     pass
             except Exception:
                 pass
-        return len(procs)
+        return len(entries)
 
     def resilient_exec(
         self,
@@ -1313,13 +2393,18 @@ class RuncRuntime(Runtime):
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
+        *,
+        lazy_pages: bool | None = None,
     ) -> RuntimeOperationStatus:
+        # Per-call override for fork-style restores that want a fast return
+        # (Sandbox.fork(lazy=True)) without flipping the configured default.
+        resolved_lazy_pages = self._restore_options.lazy_pages if lazy_pages is None else bool(lazy_pages)
         image_path = Path(self.process_checkpoint_location(sandbox_id, checkpoint_id) or "")
         work_path = self.process_work_path(sandbox_id, checkpoint_id)
         image_path.mkdir(parents=True, exist_ok=True)
         work_path.mkdir(parents=True, exist_ok=True)
         lazy_daemon_pid: int | None = None
-        if self._restore_options.lazy_pages:
+        if resolved_lazy_pages:
             lazy_daemon_pid = self._spawn_lazy_pages_daemon(
                 sandbox_id=sandbox_id,
                 checkpoint_id=checkpoint_id,
@@ -1332,7 +2417,7 @@ class RuncRuntime(Runtime):
         command.extend(
             ["--bundle", str(self.bundle_path_for(sandbox_id)), "--image-path", str(image_path), "--work-path", str(work_path)]
         )
-        command.extend(self._restore_optional_args())
+        command.extend(self._restore_optional_args(lazy_pages=resolved_lazy_pages))
         command.append(str(sandbox_id))
         try:
             return self._run_status(
@@ -1347,7 +2432,7 @@ class RuncRuntime(Runtime):
                     "work_path": str(work_path),
                     "bundle_path": str(self.bundle_path_for(sandbox_id)),
                     "state_root": str(self._paths.state_root),
-                    "lazy_pages": bool(self._restore_options.lazy_pages),
+                    "lazy_pages": resolved_lazy_pages,
                     "lazy_pages_daemon_pid": lazy_daemon_pid,
                 },
             )
@@ -1654,88 +2739,35 @@ class RuncRuntime(Runtime):
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> RuntimeOperationStatus:
-        dataset = self.dataset_name_for(sandbox_id)
-        snapshot = f"{dataset}@{checkpoint_id}"
-        status = self._run_status(
-            [self._zfs_bin, "snapshot", snapshot],
-            operation="sandbox.checkpoint_filesystem",
-            sandbox_id=sandbox_id,
-            checkpoint_id=checkpoint_id,
-            metadata=self.filesystem_checkpoint_metadata(sandbox_id, checkpoint_id),
-        )
-        written_bytes, used_bytes = self._query_zfs_snapshot_sizes(snapshot, sandbox_id=sandbox_id, checkpoint_id=checkpoint_id)
-        return replace(
-            status,
-            metadata={
-                **status.metadata,
-                "checkpoint_scope": "filesystem_only",
-                "filesystem_checkpoint_written_bytes": written_bytes,
-                "filesystem_checkpoint_used_bytes": used_bytes,
-            },
-        )
+        return self._fs.checkpoint_filesystem(sandbox_id, checkpoint_id)
 
     def restore_filesystem(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> RuntimeOperationStatus:
-        dataset = self.dataset_name_for(sandbox_id)
-        snapshot = f"{dataset}@{checkpoint_id}"
-        metadata: dict[str, object] = {
-            "phase": "filesystem_restore",
-            "runtime": self.name,
-            "dataset": dataset,
-            "snapshot": snapshot,
-            "mountpoint": str(self.rootfs_path_for(sandbox_id)),
-        }
-        origin = self._query_zfs_origin(dataset)
-        if origin is not None and origin.endswith(f"@{checkpoint_id}"):
-            # Dataset is a clone of the requested snapshot; its live state
-            # already matches, so rollback would be a no-op. Skipping avoids a
-            # same-name snapshot on the clone which would later collide with
-            # `zfs promote`.
-            return RuntimeOperationStatus(
-                executed=False,
-                reason="clone_origin_matches_checkpoint",
-                command=(self._zfs_bin, "rollback", "-r", snapshot),
-                metadata={**metadata, "origin": origin},
-            )
-        return self._run_status(
-            [self._zfs_bin, "rollback", "-r", snapshot],
-            operation="sandbox.restore_filesystem",
-            sandbox_id=sandbox_id,
-            checkpoint_id=checkpoint_id,
-            metadata=metadata,
-        )
-
-    def _query_zfs_origin(self, dataset: str) -> str | None:
-        result = self._run_command(
-            [self._zfs_bin, "get", "-H", "-o", "value", "origin", dataset],
-            operation="sandbox.zfs_get_origin",
-            check=False,
-            metadata={"dataset": dataset},
-        )
-        if result.returncode != 0:
-            return None
-        value = result.stdout.strip()
-        if not value or value == "-":
-            return None
-        return value
+        return self._fs.restore_filesystem(sandbox_id, checkpoint_id)
 
     def filesystem_checkpoint_metadata(
         self,
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> dict[str, object]:
-        dataset = self.dataset_name_for(sandbox_id)
-        snapshot = f"{dataset}@{checkpoint_id}"
-        return {
-            "phase": "filesystem_checkpoint",
-            "runtime": self.name,
-            "dataset": dataset,
-            "snapshot": snapshot,
-            "mountpoint": str(self.rootfs_path_for(sandbox_id)),
-        }
+        return self._fs.filesystem_checkpoint_metadata(sandbox_id, checkpoint_id)
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        return self._fs.changeset_since(sandbox_id, checkpoint_id)
+
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        return self._fs.snapshot_content_root(sandbox_id, checkpoint_id)
 
     def delete_runtime(
         self,
@@ -1801,85 +2833,14 @@ class RuncRuntime(Runtime):
         description = self._try_describe(sandbox_id)
         dataset = None if description is None else str(description.metadata.get("zfs_dataset", "")) or None
         if not dataset:
-            dataset = f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
-        result: CommandResult | None = None
-        stderr = ""
-        for attempt in range(1, _DATASET_DESTROY_BUSY_RETRIES + 1):
-            result = self._run_command(
-                [self._zfs_bin, "destroy", "-r", dataset],
-                operation="sandbox.zfs_destroy",
-                sandbox_id=sandbox_id,
-                check=False,
-                metadata={"dataset": dataset, "attempt": attempt},
-            )
-            stderr = result.stderr.strip()
-            if result.returncode == 0 or "does not exist" in stderr:
-                return
-            if "dataset is busy" not in stderr:
-                break
-            if attempt < _DATASET_DESTROY_BUSY_RETRIES:
-                logger.warning(
-                    "ZFS dataset destroy reported busy; retrying sandbox=%s dataset=%s attempt=%d/%d stderr=%s",
-                    sandbox_id,
-                    dataset,
-                    attempt,
-                    _DATASET_DESTROY_BUSY_RETRIES,
-                    stderr,
-                )
-                time.sleep(_DATASET_DESTROY_BUSY_RETRY_DELAY_S)
-        assert result is not None
-        if result.returncode != 0 and "does not exist" not in stderr:
-            raise RuntimeError(
-                f"command failed ({result.returncode}): {self._zfs_bin} destroy -r {dataset}"
-                f"\nstdout: {result.stdout.strip()}"
-                f"\nstderr: {stderr}"
-            )
+            dataset = self._fs.default_dataset_name(sandbox_id)
+        self._fs.destroy_filesystem_dataset(sandbox_id, dataset)
+
+    def destroy_filesystem_ref(self, fs_ref: str) -> None:
+        self._fs.destroy_snapshot_ref(fs_ref)
 
     def promote_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
-        dataset = self.dataset_name_for(sandbox_id)
-        last_result: CommandResult | None = None
-        last_stderr = ""
-        for attempt in range(1, _DATASET_PROMOTE_CONFLICT_RETRIES + 1):
-            result = self._run_command(
-                [self._zfs_bin, "promote", dataset],
-                operation="sandbox.zfs_promote",
-                sandbox_id=sandbox_id,
-                check=False,
-                metadata={"dataset": dataset, "attempt": attempt},
-            )
-            stderr = result.stderr.strip()
-            if result.returncode == 0:
-                return
-            if "not a cloned filesystem" in stderr or "does not exist" in stderr:
-                return
-            conflict_match = _PROMOTE_CONFLICTING_SNAPSHOT_RE.search(stderr)
-            if conflict_match is None:
-                last_result = result
-                last_stderr = stderr
-                break
-            snapshot_name = conflict_match.group(1)
-            logger.warning(
-                "ZFS dataset promote reported conflicting snapshot; deleting child snapshot and retrying "
-                "sandbox=%s dataset=%s snapshot=%s attempt=%d/%d",
-                sandbox_id,
-                dataset,
-                snapshot_name,
-                attempt,
-                _DATASET_PROMOTE_CONFLICT_RETRIES,
-            )
-            self._destroy_dataset_snapshot(
-                dataset,
-                snapshot_name,
-                sandbox_id=sandbox_id,
-            )
-            last_result = result
-            last_stderr = stderr
-        assert last_result is not None
-        raise RuntimeError(
-            f"command failed ({last_result.returncode}): {self._zfs_bin} promote {dataset}"
-            f"\nstdout: {last_result.stdout.strip()}"
-            f"\nstderr: {last_stderr}"
-        )
+        self._fs.promote_filesystem_dataset(sandbox_id)
 
     def clone_filesystem_snapshot(
         self,
@@ -1889,24 +2850,12 @@ class RuncRuntime(Runtime):
         *,
         target_rootfs_path: Path,
     ) -> str:
-        source_dataset = self.dataset_name_for(source_sandbox_id)
-        target_dataset = f"{self._paths.zfs_dataset_prefix}/{target_sandbox_id}"
-        self._run_command(
-            [self._zfs_bin, "destroy", "-r", target_dataset],
-            operation="sandbox.zfs_destroy_clone_target",
-            sandbox_id=target_sandbox_id,
-            check=False,
-            metadata={"dataset": target_dataset},
+        return self._fs.clone_filesystem_snapshot(
+            source_sandbox_id,
+            checkpoint_id,
+            target_sandbox_id,
+            target_rootfs_path=target_rootfs_path,
         )
-        snapshot = f"{source_dataset}@{checkpoint_id}"
-        self._run_command(
-            [self._zfs_bin, "clone", "-o", f"mountpoint={target_rootfs_path}", snapshot, target_dataset],
-            operation="sandbox.zfs_clone",
-            sandbox_id=target_sandbox_id,
-            checkpoint_id=checkpoint_id,
-            metadata={"source_dataset": source_dataset, "target_dataset": target_dataset, "mountpoint": str(target_rootfs_path)},
-        )
-        return target_dataset
 
     def bundle_path_for(self, sandbox_id: SandboxId) -> Path:
         description = self._try_describe(sandbox_id)
@@ -1923,41 +2872,8 @@ class RuncRuntime(Runtime):
     def dataset_name_for(self, sandbox_id: SandboxId) -> str:
         description = self._try_describe(sandbox_id)
         if description is None:
-            return f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"
-        return str(description.metadata.get("zfs_dataset", f"{self._paths.zfs_dataset_prefix}/{sandbox_id}"))
-
-    def _destroy_dataset_snapshot(
-        self,
-        dataset: str,
-        snapshot_name: str,
-        *,
-        sandbox_id: SandboxId,
-    ) -> None:
-        snapshot = f"{dataset}@{snapshot_name}"
-        result = self._run_command(
-            [self._zfs_bin, "destroy", snapshot],
-            operation="sandbox.zfs_destroy_snapshot",
-            sandbox_id=sandbox_id,
-            check=False,
-            metadata={"dataset": dataset, "snapshot": snapshot},
-        )
-        stderr = result.stderr.strip()
-        if result.returncode == 0 or "does not exist" in stderr or "snapshot does not exist" in stderr:
-            return
-        raise RuntimeError(
-            f"command failed ({result.returncode}): {self._zfs_bin} destroy {snapshot}"
-            f"\nstdout: {result.stdout.strip()}"
-            f"\nstderr: {stderr}"
-        )
-
-    def _zfs_dataset_exists(self, dataset: str) -> bool:
-        result = self._run_command(
-            [self._zfs_bin, "list", "-H", "-o", "name", dataset],
-            operation="sandbox.zfs_exists",
-            check=False,
-            metadata={"dataset": dataset},
-        )
-        return result.returncode == 0
+            return self._fs.default_dataset_name(sandbox_id)
+        return str(description.metadata.get("zfs_dataset", self._fs.default_dataset_name(sandbox_id)))
 
     def process_work_path(self, sandbox_id: SandboxId, checkpoint_id: CheckpointId) -> Path:
         return self._paths.checkpoint_root / str(sandbox_id) / str(checkpoint_id) / "work"
@@ -1984,32 +2900,7 @@ class RuncRuntime(Runtime):
                     checkpoint_id,
                     process_root,
                 )
-        dataset = self.dataset_name_for(sandbox_id)
-        snapshot = f"{dataset}@{checkpoint_id}"
-        if self._zfs_snapshot_exists(snapshot):
-            try:
-                self._run_command(
-                    [self._zfs_bin, "destroy", snapshot],
-                    operation="sandbox.discard_partial_checkpoint",
-                    check=False,
-                    metadata={"snapshot": snapshot},
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to destroy partial zfs snapshot sandbox=%s checkpoint=%s snapshot=%s",
-                    sandbox_id,
-                    checkpoint_id,
-                    snapshot,
-                )
-
-    def _zfs_snapshot_exists(self, snapshot: str) -> bool:
-        result = self._run_command(
-            [self._zfs_bin, "list", "-H", "-o", "name", "-t", "snapshot", snapshot],
-            operation="sandbox.zfs_snapshot_exists",
-            check=False,
-            metadata={"snapshot": snapshot},
-        )
-        return result.returncode == 0
+        self._fs.discard_partial_checkpoint(sandbox_id, checkpoint_id)
 
     def _persist(self, description: SandboxDescription) -> None:
         path = self._metadata_path(description.sandbox_id)
@@ -2291,7 +3182,8 @@ class RuncRuntime(Runtime):
         args.extend(self._checkpoint_options.extra_args)
         return args
 
-    def _restore_optional_args(self) -> list[str]:
+    def _restore_optional_args(self, *, lazy_pages: bool | None = None) -> list[str]:
+        resolved_lazy_pages = self._restore_options.lazy_pages if lazy_pages is None else bool(lazy_pages)
         args: list[str] = []
         if self._restore_options.tcp_established:
             args.append("--tcp-established")
@@ -2299,7 +3191,7 @@ class RuncRuntime(Runtime):
             args.append("--shell-job")
         if self._restore_options.ext_unix_sk:
             args.append("--ext-unix-sk")
-        if self._restore_options.lazy_pages:
+        if resolved_lazy_pages:
             args.append("--lazy-pages")
         args.extend(self._restore_options.extra_args)
         return args
@@ -2319,33 +3211,3 @@ class RuncRuntime(Runtime):
         except OSError:
             return 0, 0
         return size_bytes, file_count
-
-    def _query_zfs_snapshot_sizes(
-        self,
-        snapshot: str,
-        *,
-        sandbox_id: SandboxId,
-        checkpoint_id: CheckpointId,
-    ) -> tuple[int | None, int | None]:
-        result = self._run_command(
-            [self._zfs_bin, "get", "-Hp", "-o", "property,value", "written,used", snapshot],
-            operation="sandbox.zfs_snapshot_stats",
-            sandbox_id=sandbox_id,
-            checkpoint_id=checkpoint_id,
-            check=False,
-            metadata={"snapshot": snapshot},
-        )
-        if result.returncode != 0:
-            return None, None
-        values: dict[str, int] = {}
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            property_name = parts[0].strip()
-            raw_value = parts[1].strip()
-            try:
-                values[property_name] = int(raw_value)
-            except ValueError:
-                continue
-        return values.get("written"), values.get("used")

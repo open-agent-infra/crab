@@ -335,12 +335,12 @@ class MiniSWESpecTraceReplayTests(unittest.TestCase):
 
             draft = state.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-Agentcr-Spec-Role": "draft", "X-Agentcr-Spec-Pair-Id": "pair-1"},
+                headers={"x-crab-spec-role": "draft", "X-CRAB-SPEC-PAIR-ID": "pair-1"},
                 payload={},
             )
             oracle = state.handle_request(
                 path="/v1/chat/completions",
-                headers={"X-Agentcr-Spec-Role": "oracle", "X-Agentcr-Spec-Pair-Id": "pair-1"},
+                headers={"X-Crab-Spec-Role": "oracle", "x-crab-spec-pair-id": "pair-1"},
                 payload={},
             )
             snapshot = state.snapshot()

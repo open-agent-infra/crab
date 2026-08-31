@@ -109,5 +109,74 @@ class RuncRuntimePrepareTests(unittest.TestCase):
             self.assertIn(payload["metadata"]["generation"], {1, 2})
 
 
+class UpdateNetworkMetadataTests(unittest.TestCase):
+    """PR-N1 decision 9: promotion adopts the fork's lease, so the source's
+    launch-time network metadata goes dead. Two readers depend on it (the
+    interceptor attribution fallback and Sandbox.get_host), so the swap must
+    rewrite it — a transfer that fixes only the lease passes the socket
+    assertions while silently breaking attribution."""
+
+    def _runtime(self, root: Path) -> RuncRuntime:
+        return RuncRuntime(
+            paths=RuncRuntimePaths(
+                state_root=root / "state",
+                bundle_root=root / "bundles",
+                checkpoint_root=root / "checkpoints",
+                metadata_root=root / "metadata",
+                zfs_dataset_prefix="pool/crab",
+            )
+        )
+
+    def test_rewrites_guest_ip_and_netns_preserving_other_metadata(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_runc_meta_") as tmp:
+            root = Path(tmp)
+            runtime = self._runtime(root)
+            sandbox_id = SandboxId("sbx-src")
+            runtime.adopt_sandbox_description(
+                sandbox_id,
+                runtime_name="runc",
+                status="running",
+                metadata={
+                    "guest_ip": "10.250.0.2",
+                    "network_namespace_path": "/var/run/netns/ts-old",
+                    "bridge_ip": "10.250.0.1",
+                },
+            )
+
+            runtime.update_network_metadata(
+                sandbox_id,
+                guest_ip="10.250.0.3",
+                network_namespace_path="/var/run/netns/ts-new",
+            )
+
+            described = runtime.describe(sandbox_id)
+            self.assertEqual(described.metadata["guest_ip"], "10.250.0.3")
+            self.assertEqual(
+                described.metadata["network_namespace_path"], "/var/run/netns/ts-new"
+            )
+            # Untouched keys survive the rewrite.
+            self.assertEqual(described.metadata["bridge_ip"], "10.250.0.1")
+            # The change is persisted, not just in-memory: this is what the
+            # interceptor's inspect_runtime attribution fallback reads back.
+            payload = json.loads(
+                (root / "metadata" / "sbx-src.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["metadata"]["guest_ip"], "10.250.0.3")
+            self.assertEqual(
+                payload["metadata"]["network_namespace_path"], "/var/run/netns/ts-new"
+            )
+
+    def test_missing_sandbox_is_ignored(self) -> None:
+        # The caller is mid-swap; a sandbox with no description has no
+        # metadata to correct and must not raise.
+        with tempfile.TemporaryDirectory(prefix="crab_runc_meta_") as tmp:
+            runtime = self._runtime(Path(tmp))
+            runtime.update_network_metadata(
+                SandboxId("sbx-absent"),
+                guest_ip="10.250.0.9",
+                network_namespace_path="/var/run/netns/ts-x",
+            )  # no raise
+
+
 if __name__ == "__main__":
     unittest.main()

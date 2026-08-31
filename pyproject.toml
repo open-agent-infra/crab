@@ -19,6 +19,9 @@ dependencies = [
     "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+tls = ["cryptography>=3.1"]
+
 [project.urls]
 Homepage = "https://github.com/open-agent-infra/crab"
 Repository = "https://github.com/open-agent-infra/crab.git"
@@ -28,14 +31,19 @@ Paper = "https://arxiv.org/abs/2604.28138"
 
 [project.scripts]
 # Operator CLI — talks to the daemon over the Unix-domain socket.
-# Subcommands: daemon start/stop/status, info, sandbox run/ls/rm/exec/stop/pause/resume,
-# checkpoint create/ls/rm/restore. See `crab --help`.
+# Subcommands: daemon start/stop/status, info, sandbox run/ls/rm/exec/fork/stop/pause/resume,
+# checkpoint create/ls/rm/restore, txn begin/commit/abort/status. See `crab --help`.
 crab = "crab.cli:main"
 
 # Daemon entry point. Equivalent to `python -m crab.daemon`.
 # Typically wrapped by a systemd unit; for development, prefer
 # `crab daemon start [--foreground]`.
 crabd = "crab.daemon.server:main"
+
+# Service gateway (track S). Equivalent to `python -m crab.gateway`.
+# `crab-gateway serve` runs the process; `tenants`/`keys`/`quotas`
+# subcommands administer a running gateway over its local Unix socket.
+crab-gateway = "crab.gateway.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

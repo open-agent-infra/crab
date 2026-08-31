@@ -9,6 +9,7 @@ from .ids import CheckpointId, JobId, SandboxId
 from .models import (
     ArtifactPayload,
     ArtifactReference,
+    ChangesetEntry,
     CheckpointJob,
     CheckpointManifest,
     CheckpointResult,
@@ -56,6 +57,14 @@ class Runtime(ABC):
 
     @abstractmethod
     def resume(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def start(self, sandbox_id: SandboxId) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def restart(self, sandbox_id: SandboxId) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -230,6 +239,34 @@ class Runtime(ABC):
         _ = path
         return False
 
+    def adopt_sandbox_description(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        runtime_name: str,
+        status: str,
+        metadata: dict[str, object],
+    ) -> None:
+        """Register a sandbox this runtime did not launch itself (a fork
+        materialized from another sandbox's checkpoint). Restore flows
+        (`prepare_for_restore`/`mark_restored`) require a description to
+        exist. Default: no-op for runtimes without persistent descriptions.
+        """
+        _ = (sandbox_id, runtime_name, status, metadata)
+        return None
+
+    def destroy_filesystem_ref(self, fs_ref: str) -> None:
+        """Storage retention hook: destroy a filesystem checkpoint by the
+        opaque ``fs_ref`` recorded in its artifact payload. Routed to the
+        runtime's filesystem provider so storage never shells out to a
+        backend binary itself. Best-effort by contract: unknown refs and
+        already-deleted snapshots are tolerated.
+
+        Default: no-op (runtimes without filesystem checkpoints).
+        """
+        _ = fs_ref
+        return None
+
     @abstractmethod
     def checkpoint_filesystem(
         self,
@@ -290,6 +327,27 @@ class Runtime(ABC):
         *,
         target_rootfs_path: Path,
     ) -> str:
+        raise NotImplementedError
+
+    def changeset_since(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> list[ChangesetEntry]:
+        """Changed rootfs paths relative to the checkpoint's filesystem
+        snapshot, sorted by path (C1). Optional capability: runtimes
+        without a CoW filesystem provider do not implement it."""
+        raise NotImplementedError
+
+    def snapshot_content_root(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+    ) -> Path:
+        """Host-side directory exposing the read-only content of the
+        checkpoint's filesystem snapshot (C2 merge reads three-way base
+        and rollback content from it). Optional capability, mirroring
+        ``changeset_since``."""
         raise NotImplementedError
 
 
@@ -473,6 +531,48 @@ class RequestInterceptorHook(ABC):
         raise NotImplementedError
 
 
+class ActionRecorder(ABC):
+    """Sink for the per-sandbox action journal (roadmap B1).
+
+    Implemented by `crab.journal.ActionJournal`; injected into runtimes so
+    they can record exec attempts and launch markers without importing
+    storage. Recording must never break the recorded operation — callers
+    wrap invocations defensively."""
+
+    @abstractmethod
+    def record_exec(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        argv: list[str],
+        cwd: str | None,
+        env: dict[str, object] | None,
+        user: str | None,
+        timeout_s: float | None,
+        capture_output: bool,
+        returncode: int | None,
+        duration_ms: float,
+        stdout: str | None,
+        stderr: str | None,
+        started_at: str,
+        finished_at: str,
+        timed_out: bool = False,
+        txn_id: str | None = None,
+    ) -> object:
+        raise NotImplementedError
+
+    @abstractmethod
+    def record_lifecycle(
+        self,
+        sandbox_id: SandboxId,
+        event: str,
+        *,
+        metadata: dict[str, object] | None = None,
+        txn_id: str | None = None,
+    ) -> object:
+        raise NotImplementedError
+
+
 class TelemetrySink(ABC):
     @abstractmethod
     def emit_event(self, name: str, attributes: dict[str, object]) -> None:
@@ -542,3 +642,23 @@ class SchedulerStateStore(ABC):
         """
         _ = sandbox_id
         return 0
+
+    def set_process_checkpoint_base(
+        self,
+        sandbox_id: SandboxId,
+        checkpoint_id: CheckpointId,
+        *,
+        chain_length: int,
+    ) -> None:
+        """Set an exact process-chain cursor after restoring history.
+
+        Stores predating exact chain tracking retain safe behavior by treating
+        the restored point as a full base. Implementations that track chain
+        length should override this method.
+        """
+        _ = chain_length
+        self.record_process_checkpoint(
+            sandbox_id,
+            checkpoint_id,
+            is_incremental=False,
+        )

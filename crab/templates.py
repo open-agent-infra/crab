@@ -18,24 +18,6 @@ from .ids import SandboxId
 if TYPE_CHECKING:
     from .engine import Engine
 
-_COMPOSE_PROCESS_CAPABILITIES = [
-    "CAP_AUDIT_WRITE",
-    "CAP_CHOWN",
-    "CAP_DAC_OVERRIDE",
-    "CAP_FOWNER",
-    "CAP_FSETID",
-    "CAP_KILL",
-    "CAP_MKNOD",
-    "CAP_NET_BIND_SERVICE",
-    "CAP_NET_RAW",
-    "CAP_SETFCAP",
-    "CAP_SETGID",
-    "CAP_SETPCAP",
-    "CAP_SETUID",
-    "CAP_SYS_CHROOT",
-]
-
-
 @dataclass(frozen=True)
 class TemplateLaunchData:
     runtime_metadata: dict[str, object]
@@ -127,8 +109,9 @@ class DockerComposeTemplate(SandboxTemplate):
         if task_root is not None:
             runtime_metadata["task_root"] = str(task_root)
             self._extend_tests_materialization(runtime_metadata, task_root)
-        self._ensure_dns_materialization(runtime_metadata)
-        self._configure_bundle_privileges(bundle_dir)
+        from integrations.sandboxes.runtime.baseline import add_dns_materialization
+
+        add_dns_materialization(runtime_metadata, bundle_dir=bundle_dir)
         process_cwd = self._bundle_process_cwd(bundle_dir)
         image_ref = translation.compose_launch_metadata.get("image_ref")
         return TemplateLaunchData(
@@ -188,16 +171,6 @@ class DockerComposeTemplate(SandboxTemplate):
         init_dirs.add("tests")
         runtime_metadata["rootfs_init_dirs"] = sorted(item for item in init_dirs if item)
 
-    def _ensure_dns_materialization(self, runtime_metadata: dict[str, object]) -> None:
-        host_resolv_conf = _host_resolv_conf_path()
-        if host_resolv_conf is None:
-            return
-        copy_paths = list(runtime_metadata.get("rootfs_copy_paths", []))
-        resolv_item = {"source": str(host_resolv_conf), "destination": "/etc/resolv.conf"}
-        if resolv_item not in copy_paths:
-            copy_paths.append(resolv_item)
-        runtime_metadata["rootfs_copy_paths"] = copy_paths
-
     def _bundle_process_cwd(self, bundle_dir: Path) -> str | None:
         config_path = bundle_dir / "config.json"
         try:
@@ -209,32 +182,6 @@ class DockerComposeTemplate(SandboxTemplate):
             return None
         cwd = process.get("cwd")
         return cwd if isinstance(cwd, str) and cwd else None
-
-    def _configure_bundle_privileges(self, bundle_dir: Path) -> None:
-        config_path = bundle_dir / "config.json"
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-        process = payload.get("process")
-        if not isinstance(process, dict):
-            raise ValueError(f"unsupported bundle process config in {config_path}")
-        capabilities = {
-            "bounding": list(_COMPOSE_PROCESS_CAPABILITIES),
-            "effective": list(_COMPOSE_PROCESS_CAPABILITIES),
-            "permitted": list(_COMPOSE_PROCESS_CAPABILITIES),
-            "inheritable": list(_COMPOSE_PROCESS_CAPABILITIES),
-            "ambient": list(_COMPOSE_PROCESS_CAPABILITIES),
-        }
-        process["capabilities"] = capabilities
-        process["noNewPrivileges"] = False
-        payload["process"] = process
-        config_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-def _host_resolv_conf_path() -> Path | None:
-    for candidate in (Path("/run/systemd/resolve/resolv.conf"), Path("/etc/resolv.conf")):
-        if candidate.is_file():
-            return candidate
-    return None
-
 
 __all__ = [
     "DockerComposeTemplate",

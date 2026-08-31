@@ -48,6 +48,7 @@ _CAPTURES_INFLIGHT_LLM = "captures_inflight_llm"
 _CAPTURED_REQUEST_ID = "captured_request_id"
 _CAPTURED_REQUEST_PROVIDER = "captured_request_provider"
 _CAPTURED_REQUEST_STARTED_AT = "captured_request_started_at"
+_LOGICAL_CHECKPOINT = "logical_checkpoint"
 
 
 def resolve_restore_manifest(
@@ -77,11 +78,45 @@ def resolve_restore_manifest(
 
     current_candidate = candidates[-1] if candidates else manifest
 
-    filesystem_manifest = _latest_manifest_with_artifacts(
-        candidates,
-        include=lambda candidate: bool(candidate.filesystem_artifacts),
-    )
-    process_manifest = _latest_process_manifest_for_restore(candidates, filesystem_manifest)
+    process_manifest = None
+    filesystem_manifest = None
+    if bool(current_candidate.metadata.get(_LOGICAL_CHECKPOINT, False)):
+        process_source_raw = current_candidate.metadata.get(
+            _PROCESS_RESTORE_CHECKPOINT_ID
+        )
+        filesystem_source_raw = current_candidate.metadata.get(
+            _FILESYSTEM_RESTORE_CHECKPOINT_ID
+        )
+        if process_source_raw is None or filesystem_source_raw is None:
+            raise ValueError(
+                f"logical checkpoint {current_candidate.checkpoint_id} is missing "
+                "explicit process/filesystem restore sources"
+            )
+        if process_source_raw is not None:
+            process_manifest = _restore_source_manifest(
+                checkpoint_manager,
+                current_candidate,
+                CheckpointId(str(process_source_raw)),
+                candidates,
+                component="process",
+            )
+        if filesystem_source_raw is not None:
+            filesystem_manifest = _restore_source_manifest(
+                checkpoint_manager,
+                current_candidate,
+                CheckpointId(str(filesystem_source_raw)),
+                candidates,
+                component="filesystem",
+            )
+
+    if process_manifest is None and filesystem_manifest is None:
+        filesystem_manifest = _latest_manifest_with_artifacts(
+            candidates,
+            include=lambda candidate: bool(candidate.filesystem_artifacts),
+        )
+        process_manifest = _latest_process_manifest_for_restore(
+            candidates, filesystem_manifest
+        )
 
     process_artifacts = [] if process_manifest is None else list(process_manifest.process_artifacts)
     filesystem_artifacts = [] if filesystem_manifest is None else list(filesystem_manifest.filesystem_artifacts)
@@ -126,7 +161,44 @@ def resolve_restore_manifest(
         process_artifacts=process_artifacts,
         filesystem_artifacts=filesystem_artifacts,
         metadata=metadata,
+        parent_checkpoint_id=(
+            current_candidate.parent_checkpoint_id
+            if process_manifest is None
+            else process_manifest.parent_checkpoint_id
+        ),
+        process_kind=(
+            current_candidate.process_kind
+            if process_manifest is None
+            else process_manifest.process_kind
+        ),
     ).with_integrity()
+
+
+def _restore_source_manifest(
+    checkpoint_manager: CheckpointManager,
+    logical_manifest: CheckpointManifest,
+    source_id: CheckpointId,
+    candidates: list[CheckpointManifest],
+    *,
+    component: str,
+) -> CheckpointManifest:
+    source = next(
+        (candidate for candidate in candidates if candidate.checkpoint_id == source_id),
+        None,
+    )
+    if source is None:
+        source = checkpoint_manager.get_manifest(logical_manifest.sandbox_id, source_id)
+    artifacts = (
+        source.process_artifacts
+        if component == "process"
+        else source.filesystem_artifacts
+    )
+    if not artifacts:
+        raise ValueError(
+            f"logical checkpoint {logical_manifest.checkpoint_id} references "
+            f"{component} source {source_id} without {component} artifacts"
+        )
+    return source
 
 
 def _latest_manifest_with_artifacts(

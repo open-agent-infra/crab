@@ -298,7 +298,10 @@ class RealHostIntegrationTests(unittest.TestCase):
             assert checkpoint_result is not None
             self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
             scheduler_events = [attrs for name, attrs in telemetry.events if name == "scheduler.evaluate"]
-            self.assertTrue(any(x["reason"] == "llm_request_window_available" for x in scheduler_events))
+            # checkpoint_full_baseline_on_first_checkpoint defaults to True, so
+            # the first checkpoint is an unconditional full baseline; that
+            # branch outranks the llm-window reason in the scheduler.
+            self.assertTrue(any(x["reason"] == "no_previous_checkpoint" for x in scheduler_events))
 
             tamper_path = work_dir / "host_tamper.txt"
             tamper_path.write_text("tampered\n", encoding="utf-8")

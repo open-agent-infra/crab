@@ -12,6 +12,23 @@ from .contracts import (
     TelemetrySink,
 )
 from .executor import CRExecutor
+from .errors import (
+    ImageAuthenticationError,
+    ImageCompatibilityError,
+    ImageInsufficientDiskError,
+    ImageNotFoundError,
+    ImagePlatformError,
+    ImagePolicyError,
+    ImagePullError,
+    ImagePullTimeoutError,
+    ImageRateLimitError,
+    ImageReferenceError,
+    ImageTooLargeError,
+    SandboxCreateCleanupError,
+    SandboxExecCleanupError,
+    SandboxExecTimeout,
+    SandboxImageError,
+)
 from .ids import CheckpointId, JobId, SandboxId
 from .inspector import EBPFSandboxInspector, InMemoryEBPFEventCollector, InMemorySandboxInspector
 from .interceptor import (
@@ -46,9 +63,12 @@ from .models import (
     RuntimeOperationStatus,
     SandboxDescription,
     SandboxExecResult,
+    SandboxInfo,
     SandboxRuntimeState,
     SandboxSnapshot,
+    SandboxState,
     SchedulerCheckpointDecision,
+    sandbox_state_from_status,
 )
 from .runtime import (
     CommandRunner,
@@ -110,6 +130,14 @@ from .engine import (
     shutdown_default_engine,
 )
 from .sandbox import Sandbox
+from .txn import (
+    Transaction,
+    TxnAbortError,
+    TxnActiveError,
+    TxnError,
+    TxnMismatchError,
+    TxnResolvedError,
+)
 
 # Eager import so the side-effect registrations land before the user
 # references any name from this module.
@@ -120,6 +148,27 @@ __all__ = [
     "Engine",
     "EngineConfig",
     "Sandbox",
+    "SandboxCreateCleanupError",
+    "SandboxExecCleanupError",
+    "SandboxExecTimeout",
+    "SandboxImageError",
+    "ImageAuthenticationError",
+    "ImageCompatibilityError",
+    "ImageInsufficientDiskError",
+    "ImageNotFoundError",
+    "ImagePlatformError",
+    "ImagePolicyError",
+    "ImagePullError",
+    "ImagePullTimeoutError",
+    "ImageRateLimitError",
+    "ImageReferenceError",
+    "ImageTooLargeError",
+    "Transaction",
+    "TxnAbortError",
+    "TxnActiveError",
+    "TxnError",
+    "TxnMismatchError",
+    "TxnResolvedError",
     "TaskResult",
     "get_default_engine",
     "list_agents",
@@ -185,11 +234,14 @@ __all__ = [
     "SandboxDescription",
     "SandboxExecResult",
     "SandboxId",
+    "SandboxInfo",
     "SandboxInspector",
     "SandboxRuntimeState",
     "SandboxSnapshot",
+    "SandboxState",
     "SchedulerCheckpointDecision",
     "SchedulerConfig",
+    "sandbox_state_from_status",
     "SpotPreemptionCheckpointingPolicy",
     "StorageConfig",
     "SubprocessCommandRunner",

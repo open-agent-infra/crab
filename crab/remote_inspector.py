@@ -56,7 +56,20 @@ class HostInspectorServiceClient:
         return self._post("/register", payload)
 
     def unregister_sandbox(self, sandbox_id: SandboxId) -> dict[str, object]:
-        return self._post("/unregister", {"sandbox_id": str(sandbox_id)})
+        try:
+            return self._post("/unregister", {"sandbox_id": str(sandbox_id)})
+        except HttpStatusError as exc:
+            if exc.status_code != 404:
+                raise
+            # Teardown and create rollback are deliberately idempotent.  A
+            # missing registration means the desired postcondition already
+            # holds (including failures that happen before register()).
+            return {
+                "ok": True,
+                "sandbox_id": str(sandbox_id),
+                "unregistered": False,
+                "already_absent": True,
+            }
 
     def update_filters(
         self,
@@ -94,6 +107,25 @@ class HostInspectorServiceClient:
         if captures_process:
             payload["captures_process"] = True
         return self._post("/reset", payload)
+
+    def mark_filesystem_changed(
+        self,
+        sandbox_id: SandboxId,
+        *,
+        reason: str,
+    ) -> dict[str, object]:
+        """Conservatively invalidate the filesystem-clean baseline.
+
+        This is used when a command intentionally runs in a descendant
+        cgroup that the eBPF monitor cannot attribute to the sandbox's
+        registered parent cgroup.  The marker is cleared by the same reset
+        that clears ordinary filesystem events after a checkpoint.
+        """
+
+        return self._post(
+            "/mark_filesystem_changed",
+            {"sandbox_id": str(sandbox_id), "reason": str(reason)},
+        )
 
     def close(self) -> None:
         self._http_client.close()

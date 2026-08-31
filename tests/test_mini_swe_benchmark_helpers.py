@@ -394,6 +394,11 @@ class MiniSWEBenchmarkHelperTests(unittest.TestCase):
         harness = RealHostScenarioHarness.__new__(RealHostScenarioHarness)
         harness.fork_reuse_enabled = False
         harness.eager_fork_cleanup_on_reject = True
+        harness.background_prefork_enabled = False
+        harness.prefork_min_interval_seconds = 0.0
+        harness.prefork_wait_timeout_seconds = 0.0
+        harness.prefork_max_concurrent_global = 0
+        harness._speculation_controllers_by_sandbox = {}
         harness.runtime_state_root = Path("/tmp/rt")
         harness.runtime = Mock()
         harness._effective_agent_host_root = lambda: Path("/tmp/agent-host")
@@ -449,6 +454,8 @@ class MiniSWEBenchmarkHelperTests(unittest.TestCase):
         harness._unregister_llm_service = Mock()
         harness.network_manager = Mock()
         harness._destroy_filesystem_dataset = Mock()
+        harness._fork_chain_pins = {}
+        harness._speculation_controllers_by_sandbox = {}
 
         RealHostScenarioHarness.destroy_sandbox_dataset(harness, fork)
 

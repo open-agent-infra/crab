@@ -100,26 +100,11 @@ _HOST_INSPECTOR_PORT = 9782
 _DEFAULT_IMAGE_CACHE_ROOT = ROOT / ".cache" / "crab" / "images"
 _SHARED_ROOTFS_KEY_METADATA_KEY = "shared_rootfs_key"
 _SHARED_ROOTFS_PERSIST_METADATA_KEY = "shared_rootfs_persist"
-_TERMNIUS_PROCESS_CAPABILITIES = [
-    "CAP_AUDIT_WRITE",
-    "CAP_CHOWN",
-    "CAP_DAC_OVERRIDE",
-    "CAP_FOWNER",
-    "CAP_FSETID",
-    "CAP_KILL",
-    "CAP_MKNOD",
-    "CAP_NET_BIND_SERVICE",
-    "CAP_NET_RAW",
-    "CAP_SETFCAP",
-    "CAP_SETGID",
-    "CAP_SETPCAP",
-    "CAP_SETUID",
-    "CAP_SYS_CHROOT",
-]
 _RUNTIME_LAUNCH_METADATA_LIST_KEYS = frozenset(
     {
         "rootfs_init_dirs",
         "rootfs_copy_paths",
+        "rootfs_post_clone_copy_paths",
         "host_inspector_ignore_process_rules",
         "host_inspector_ignored_path_prefixes",
     }
@@ -2829,7 +2814,9 @@ PY
         if task_record.task_root is not None:
             handle.launch_metadata["task_root"] = str(task_record.task_root)
             self._extend_termnius_rootfs_materialization(handle.launch_metadata["runtime"], task_record.task_root)
-        self._ensure_termnius_dns_materialization(handle.launch_metadata["runtime"])
+        self._ensure_termnius_dns_materialization(
+            handle.launch_metadata["runtime"], handle.bundle_dir
+        )
         self._configure_termnius_bundle_privileges(handle.bundle_dir)
         handle.launch_metadata["runtime"] = _merge_runtime_launch_metadata(
             handle.launch_metadata["runtime"],
@@ -3033,7 +3020,9 @@ PY
         if task_root is not None:
             handle.launch_metadata["task_root"] = str(task_root)
             self._extend_termnius_rootfs_materialization(handle.launch_metadata["runtime"], task_root)
-        self._ensure_termnius_dns_materialization(handle.launch_metadata["runtime"])
+        self._ensure_termnius_dns_materialization(
+            handle.launch_metadata["runtime"], handle.bundle_dir
+        )
         self._configure_termnius_bundle_privileges(handle.bundle_dir)
         if prelaunch_task_run is not None:
             handle.launch_metadata["runtime"] = _merge_runtime_launch_metadata(
@@ -3114,33 +3103,19 @@ PY
         init_dirs.add("tests")
         runtime_metadata["rootfs_init_dirs"] = sorted(init_dirs)
 
-    def _ensure_termnius_dns_materialization(self, runtime_metadata: dict[str, object]) -> None:
-        host_resolv_conf = _host_resolv_conf_path()
-        if host_resolv_conf is None:
-            return
-        copy_paths = list(runtime_metadata.get("rootfs_copy_paths", []))
-        resolv_item = {"source": str(host_resolv_conf), "destination": "/etc/resolv.conf"}
-        if resolv_item not in copy_paths:
-            copy_paths.append(resolv_item)
-        runtime_metadata["rootfs_copy_paths"] = copy_paths
+    def _ensure_termnius_dns_materialization(
+        self, runtime_metadata: dict[str, object], bundle_dir: Path
+    ) -> None:
+        from integrations.sandboxes.runtime.baseline import add_dns_materialization
+
+        add_dns_materialization(runtime_metadata, bundle_dir=bundle_dir)
 
     def _configure_termnius_bundle_privileges(self, bundle_dir: Path) -> None:
-        config_path = bundle_dir / "config.json"
-        cfg = json.loads(config_path.read_text(encoding="utf-8"))
-        process = cfg.get("process", {})
-        if not isinstance(process, dict):
-            raise ValueError(f"unsupported bundle process config in {config_path}")
-        capabilities = {
-            "bounding": list(_TERMNIUS_PROCESS_CAPABILITIES),
-            "effective": list(_TERMNIUS_PROCESS_CAPABILITIES),
-            "permitted": list(_TERMNIUS_PROCESS_CAPABILITIES),
-            "inheritable": list(_TERMNIUS_PROCESS_CAPABILITIES),
-            "ambient": list(_TERMNIUS_PROCESS_CAPABILITIES),
-        }
-        process["capabilities"] = capabilities
-        process["noNewPrivileges"] = False
-        cfg["process"] = process
-        config_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        from integrations.sandboxes.runtime.baseline import (
+            apply_sandbox_bundle_baseline,
+        )
+
+        apply_sandbox_bundle_baseline(bundle_dir)
 
     def add_interceptor_hook(self, hook: RequestInterceptorHook) -> None:
         self.interceptor_hook.add_hook(hook)

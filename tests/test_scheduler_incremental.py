@@ -40,6 +40,9 @@ class IncrementalDecisionTests(unittest.TestCase):
             process_chain_length=self.store.get_process_chain_length(self.sbx),
         )
 
+    def test_scheduler_config_enables_incremental_process_by_default(self) -> None:
+        self.assertTrue(SchedulerConfig().incremental_process_enabled)
+
     def test_first_checkpoint_is_anchor_with_pre_dump(self) -> None:
         # Chain root: not "incremental" (no parent), but produces a pre_dump
         # so the next checkpoint can chain off it.
@@ -138,6 +141,24 @@ class StateStoreChainTests(unittest.TestCase):
         store.record_process_checkpoint(sbx, CheckpointId("c-3"), is_incremental=False)
         self.assertEqual(store.get_process_chain_length(sbx), 0)
         self.assertEqual(store.get_last_process_checkpoint(sbx), CheckpointId("c-3"))
+
+        store.set_process_checkpoint_base(
+            sbx,
+            CheckpointId("c-restored"),
+            chain_length=5,
+        )
+        self.assertEqual(store.get_process_chain_length(sbx), 5)
+        self.assertEqual(
+            store.get_last_process_checkpoint(sbx),
+            CheckpointId("c-restored"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "chain_length"):
+            store.set_process_checkpoint_base(
+                sbx,
+                CheckpointId("c-invalid"),
+                chain_length=-1,
+            )
 
 
 if __name__ == "__main__":

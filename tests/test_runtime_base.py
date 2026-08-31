@@ -4,7 +4,9 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
+from crab.ids import SandboxId
 from crab.runtime.base import SubprocessCommandRunner
+from crab.runtime.in_memory import InMemoryRuntime
 
 
 class RuntimeBaseTests(unittest.TestCase):
@@ -62,6 +64,25 @@ class RuntimeBaseTests(unittest.TestCase):
             runner.run(["zfs", "create", "pool/test"], timeout_seconds=123.0)
 
         self.assertEqual(run_mock.call_args.kwargs["timeout"], 123.0)
+
+
+class InMemoryRuntimeLifecycleTests(unittest.TestCase):
+    def _launched(self) -> tuple[InMemoryRuntime, SandboxId]:
+        runtime = InMemoryRuntime()
+        sandbox_id = runtime.launch("in-memory")
+        return runtime, sandbox_id
+
+    def test_start_relaunches_stopped_sandbox(self) -> None:
+        runtime, sid = self._launched()
+        runtime.stop(sid)
+        self.assertEqual(runtime.describe(sid).status, "stopped")
+        runtime.start(sid)
+        self.assertEqual(runtime.describe(sid).status, "running")
+
+    def test_restart_returns_sandbox_to_running(self) -> None:
+        runtime, sid = self._launched()
+        runtime.restart(sid)
+        self.assertEqual(runtime.describe(sid).status, "running")
 
 
 if __name__ == "__main__":

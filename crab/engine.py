@@ -30,6 +30,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import uuid
 import socket
 import subprocess
 import sys
@@ -37,15 +39,17 @@ import tempfile
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from .config import ExecutorConfig, SchedulerConfig, StorageConfig, TelemetryConfig
 from .contracts import Runtime
+from .errors import SandboxCreateCleanupError
 from .executor import CRExecutor
-from .ids import SandboxId
+from .ids import CheckpointId, SandboxId
 from .inspector import EBPFSandboxInspector
+from .journal import ActionJournal
 from .interceptor import (
     CrabRequestInterceptorServer,
     CompositeRequestInterceptorHook,
@@ -54,16 +58,21 @@ from .interceptor import (
     SandboxResponseGateRegistry,
 )
 from .remote_inspector import HostInspectorServiceClient, RemoteSandboxInspector
+from . import forking
 from .runtime import (
+    BtrfsProvider,
+    OverlayProvider,
     RuncCheckpointOptions,
     RuncRestoreOptions,
     RuncRuntime,
     RuncRuntimeOptions,
     RuncRuntimePaths,
+    ZfsProvider,
 )
 from .scheduler import CRScheduler, FaultToleranceCheckpointingPolicy, InMemorySchedulerStateStore
 from .sdk_llm_forwarder import SdkLLMForwarder, serve_sdk_llm_forwarder
 from .storage import LocalCheckpointManager
+from .models import SandboxSnapshot, utc_now
 from .system import CrabSystem, build_default_system
 from .telemetry import build_configured_telemetry_sink
 from .workers import (
@@ -130,6 +139,28 @@ def _as_float(value: object, *, default: float) -> float:
     if value is None:
         return default
     return float(value)
+
+
+def _as_string_tuple(
+    value: object,
+    *,
+    default: tuple[str, ...] = (),
+    label: str,
+) -> tuple[str, ...]:
+    if value is None:
+        return default
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a list of strings")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(f"{label} must be a list of strings") from exc
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError(f"{label} must contain only strings")
+    normalized = tuple(item.strip() for item in items)
+    if any(not item for item in normalized):
+        raise ValueError(f"{label} must not contain empty strings")
+    return normalized
 
 
 def _find_free_port() -> int:
@@ -286,6 +317,11 @@ def _runc_options_from_mapping(data: Mapping[str, Any]) -> RuncRuntimeOptions:
         restore=restore,
         command_timeout_seconds=float(data.get("command_timeout_seconds", base.command_timeout_seconds)),
         zfs_prepare_timeout_seconds=float(data.get("zfs_prepare_timeout_seconds", base.zfs_prepare_timeout_seconds)),
+        filesystem_backend=str(data.get("filesystem_backend", base.filesystem_backend)).strip().lower(),
+        btrfs_qgroups_enabled=_as_bool(
+            data.get("btrfs_qgroups_enabled"),
+            default=base.btrfs_qgroups_enabled,
+        ),
     )
 
 
@@ -297,6 +333,7 @@ def _runc_paths_from_mapping(data: Mapping[str, Any], *, base_dir: Path) -> Runc
         checkpoint_root=_resolve_config_path(data.get("checkpoint_root"), base_dir=base_dir) or base.checkpoint_root,
         metadata_root=_resolve_config_path(data.get("metadata_root"), base_dir=base_dir) or base.metadata_root,
         zfs_dataset_prefix=str(data.get("zfs_dataset_prefix", base.zfs_dataset_prefix)).rstrip("/"),
+        btrfs_root=_resolve_config_path(data.get("btrfs_root"), base_dir=base_dir) or base.btrfs_root,
     )
 
 
@@ -310,6 +347,25 @@ def _coerce_engine_config(config: object | None) -> "EngineConfig":
     if isinstance(config, Mapping):
         return EngineConfig.from_mapping(config)
     raise TypeError(f"unsupported engine config type: {type(config).__name__}")
+
+
+def _build_tls_interceptor(cfg: "EngineConfig") -> object | None:
+    """Construct a TLSInterceptor when TLS interception is enabled.
+
+    The import of ``crab.tls_interceptor`` (and transitively ``cryptography``)
+    is deferred to this function body so that deployments which never enable
+    interception do not need the ``crab[tls]`` extra installed.
+    """
+    if not cfg.egress_tls_interception_enabled:
+        return None
+    from .tls_interceptor import TLSInterceptor  # lazy: requires crab[tls]
+
+    storage_dir = Path(cfg.storage_root) / "tls" if cfg.storage_root else Path("/tmp/crab-tls")
+    return TLSInterceptor(
+        storage_dir,
+        bypass_hosts=cfg.egress_tls_bypass_hosts,
+        on_handshake_failure=cfg.egress_tls_on_handshake_failure,
+    )
 
 
 @dataclass
@@ -353,8 +409,120 @@ class EngineConfig:
     LLM tagging (e.g. bare-image experiments). Disables the forwarder too."""
 
     enable_sandbox_network: bool = True
-    """For runc, create a small bridge/veth network when in-sandbox agents
-    need deterministic LLM request attribution across multiple sandboxes."""
+    """For runc, make Crab-managed per-sandbox network namespaces available.
+
+    New sandboxes use them by default. Callers may still request host networking
+    explicitly with ``Sandbox(network=False)``.
+    """
+
+    enable_action_journal: bool = True
+    """Record every sandbox exec + lifecycle marker into the per-sandbox
+    action journal under the storage root (roadmap B1). Cheap JSONL
+    appends; disable for runs that must avoid any extra I/O."""
+
+    enable_egress_proxy: bool = False
+    """Route all sandbox TCP egress through the host-side transparent
+    proxy and record every flow in the effect ledger (roadmap D1).
+    Off by default: it rewires the sandbox's outbound path. Requires
+    runtime="runc", enable_sandbox_network=True and the action journal
+    (the ledger's store). Host-bound traffic is never redirected, so the
+    LLM interceptor path is unaffected."""
+
+    egress_proxy_port: int = 0
+    """Port for the egress proxy; 0 picks a free one."""
+
+    egress_rules: tuple = ()
+    """Host-scoped classification overrides for the effect ledger, e.g.
+    ``({"host_glob": "*.internal.example", "classify": "idempotent_read"},)``.
+    Encrypted flows are ``opaque`` by default because the proxy cannot
+    see the method; rules are how a deployment states what it knows."""
+
+    egress_tls_interception_enabled: bool = False
+    """Terminate TLS in the egress proxy to classify HTTPS flows the
+    same way as plaintext HTTP (roadmap T1). Off by default: today's
+    opaque-tunnel behavior is preserved unless explicitly enabled.
+    Requires `crab[tls]` (the cryptography package)."""
+
+    egress_tls_on_handshake_failure: str = "passthrough"
+    """What happens when the sandbox rejects our minted leaf cert
+    (pinning, missing trust). `passthrough` adds the host to a runtime
+    bypass set and closes the connection (client retries go opaque);
+    `refuse` closes the connection with no fallback."""
+
+    egress_tls_bypass_hosts: tuple = ()
+    """Host globs that are never intercepted (matched on SNI before any
+    TLS termination). Uses fnmatch style, e.g. `("*.pinned.example",)`."""
+
+    enable_egress_recording: bool = False
+    """Record request/response bodies for plaintext HTTP idempotent reads
+    into per-sandbox cassettes (roadmap D2), so replays can serve them
+    back. Requires the egress proxy. Off by default: it persists response
+    bodies to disk. With TLS interception, HTTPS reads become recordable."""
+
+    egress_recording_max_body_bytes: int = 1024 * 1024
+    """Per-body cap; larger exchanges are marked truncated and are never
+    replayable."""
+
+    egress_recording_record_errors: bool = False
+    """Also record 4xx/5xx responses."""
+
+    egress_recording_varying_headers: tuple = ("accept", "accept-encoding")
+    """Request headers that participate in the cassette key. Add ``range``
+    (together with ``egress_recording_record_partial``) for ranged reads."""
+
+    egress_recording_record_partial: bool = False
+    """Record 206 responses. Only meaningful with ``range`` among the
+    varying headers, or different ranges would collide on one cassette."""
+
+    effects_default_policy: str = "allow"
+    """Effect policy for snapshot transactions (roadmap D3):
+    ``allow`` (writes pass through, aborts report what already left),
+    ``defer`` (allow-listed writes queue until commit, answered 202),
+    ``reject`` (writes refused with 503), ``seal`` (writes pass but the
+    txn becomes non-abortable). Default keeps today's behavior."""
+
+    effects_fork_policy: str = "reject"
+    """Policy for fork-backed transactions: a speculative fork should not
+    write to the world (roadmap: "multiple forks must not double-fire
+    external writes")."""
+
+    effects_standalone_fork_policy: str = "allow"
+    """Policy for a `sandbox.fork()` taken **outside** any transaction
+    (roadmap F1). Distinct from ``effects_fork_policy``, which governs
+    fork-*backed transactions*: an independent branch (RL rollout, tree
+    search) is a first-class timeline whose external effects are intended,
+    so the default stays ``allow`` and today's forks keep writing. A
+    speculative fork — one that serves a main line and must produce its
+    effect exactly once — opts in per call via ``fork(effects="reject")``
+    or by flipping this default. Only ``allow``/``reject`` apply; ``defer``
+    and ``seal`` are refused for a bare fork (no commit to flush a queue
+    into, no abort for a seal to block)."""
+
+    effects_rules: tuple = ()
+    """Endpoints that tolerate deferral, e.g.
+    ``({"host_glob": "*.internal", "method": "POST", "path_glob": "/events*"},)``.
+    Empty by default: under ``defer`` an unlisted write is refused rather
+    than silently queued, since only the deployment knows whether a caller
+    can accept ``202`` instead of the real response."""
+
+    effects_on_unlisted: str = "reject"
+    """What ``defer`` does with writes that match no rule."""
+
+    effects_opaque_effects: str = "allow"
+    """Encrypted/raw flows carry no method, so they cannot be classified:
+    ``allow`` (default) lets them through — refusing would break HTTPS
+    reads too; ``reject`` gives a hard seal; ``seal`` marks the txn
+    non-abortable on the first opaque flow. Without TLS interception a
+    transaction using HTTPS cannot be guaranteed write-free."""
+
+    effects_max_queue_bytes: int = 16 * 1024 * 1024
+    """Whole-queue byte ceiling per transaction. Deferred bodies live in
+    the daemon's memory until commit, so the per-request cap alone cannot
+    bound a loop that posts many allow-listed writes; past this the write
+    is refused (``effect_reason="queue_full"``)."""
+
+    effects_max_queue_entries: int = 256
+    """Whole-queue entry ceiling per transaction (same reasoning)."""
 
     network_expected_sandboxes: int | None = None
     """Optional capacity hint for the bridge network allocator."""
@@ -371,6 +539,31 @@ class EngineConfig:
     `$CRAB_ZFS_DATASET_PREFIX`, `$CRAB_ZPOOL_NAME/crab-sdk`, or
     an installed zpool whose name starts with `crab`."""
 
+    filesystem_backend: str = "zfs"
+    """CoW backend for sandbox rootfs checkpoints: `zfs` (default),
+    `btrfs`, or `overlay` (overlayfs rootfs with upper/work subvolumes
+    on btrfs). With btrfs/overlay, the engine verifies the btrfs area
+    instead of resolving/creating a zpool dataset prefix."""
+
+    btrfs_root: Path | None = None
+    """Root of the btrfs filesystem holding sandbox subvolumes. Only
+    used when `filesystem_backend == "btrfs"`. Defaults to
+    `/var/lib/crab/btrfs` (the installer's `--fs-backend btrfs` mount).
+    Mount it `noatime` (the installer does): with atime enabled, mere
+    reads leak into `btrfs send`-based changesets as utimes-only noise."""
+
+    overlay_root: Path | None = None
+    """Root of the overlay backend's btrfs area (per-sandbox upper/work
+    subvolumes, shared lowers, snapshot mounts). Only used when
+    `filesystem_backend == "overlay"`; defaults to `<btrfs_root>/overlay`
+    so a host prepared with `--fs-backend btrfs`/`overlay` runs overlay
+    with zero extra setup and the two backends' namespaces never
+    collide. Must sit on a btrfs mount (same noatime advice applies)."""
+
+    btrfs_qgroups_enabled: bool = False
+    """Enable btrfs qgroups-backed per-snapshot byte stats (real
+    overhead; off by default, stats degrade to unknown)."""
+
     runtime_root: Path | None = None
     """Host root for runc state, bundles, metadata, image cache, work dirs,
     and per-agent state. Defaults under `storage_root`."""
@@ -379,6 +572,16 @@ class EngineConfig:
     work_dir_host_root: Path | None = None
     agent_state_root: Path | None = None
     default_image: str = "ubuntu:22.04"
+    image_pull_policy: str = "if-not-present"
+    image_allowed_registries: tuple[str, ...] = ("docker.io",)
+    image_allowed_references: tuple[str, ...] = ()
+    image_pull_timeout_seconds: float = 600.0
+    image_max_bytes: int = 8 * 1024 * 1024 * 1024
+    image_cache_max_bytes: int = 20 * 1024 * 1024 * 1024
+    image_min_free_bytes: int = 2 * 1024 * 1024 * 1024
+    image_cache_retention_seconds: float = 30 * 24 * 60 * 60
+    image_prewarm: tuple[str, ...] = ()
+    image_prewarm_required: tuple[str, ...] = ()
 
     scheduler_config: SchedulerConfig | None = None
     executor_config: ExecutorConfig | None = None
@@ -434,6 +637,16 @@ class EngineConfig:
         forwarder = _optional_mapping(data.get("forwarder"), label="forwarder")
         logging_config = _optional_mapping(data.get("logging"), label="logging")
         host_inspector = _optional_mapping(data.get("host_inspector"), label="host_inspector")
+        journal_data = _optional_mapping(data.get("journal"), label="journal")
+        egress = _optional_mapping(data.get("egress"), label="egress")
+        tls_interception = _optional_mapping(
+            egress.get("tls_interception"), label="egress.tls_interception"
+        )
+        recording = _optional_mapping(egress.get("recording"), label="egress.recording")
+        effects = _optional_mapping(data.get("effects"), label="effects")
+        images = _optional_mapping(
+            data.get("images", data.get("image_policy")), label="images"
+        )
 
         default_workers = _as_int(data.get("max_workers"), default=None)
         executor_data = _optional_mapping(data.get("executor"), label="executor")
@@ -441,6 +654,10 @@ class EngineConfig:
         telemetry_data = _optional_mapping(data.get("telemetry"), label="telemetry")
         runc_data = _optional_mapping(data.get("runc"), label="runc")
         runc_paths_data = _optional_mapping(data.get("runc_paths"), label="runc_paths")
+        filesystem_data = _optional_mapping(data.get("filesystem"), label="filesystem")
+        btrfs_data = _optional_mapping(filesystem_data.get("btrfs"), label="filesystem.btrfs")
+        zfs_data = _optional_mapping(filesystem_data.get("zfs"), label="filesystem.zfs")
+        overlay_data = _optional_mapping(filesystem_data.get("overlay"), label="filesystem.overlay")
 
         storage_root = _resolve_config_path(
             data.get("storage_root", storage_planes.get("storage_root")),
@@ -512,6 +729,91 @@ class EngineConfig:
                 network.get("enable_sandbox_network", data.get("enable_sandbox_network")),
                 default=True,
             ),
+            enable_action_journal=_as_bool(
+                journal_data.get("enabled", data.get("enable_action_journal")),
+                default=True,
+            ),
+            enable_egress_proxy=_as_bool(
+                egress.get("enabled", data.get("enable_egress_proxy")),
+                default=False,
+            ),
+            egress_proxy_port=_as_int(
+                egress.get("port", data.get("egress_proxy_port")),
+                default=0,
+            )
+            or 0,
+            egress_rules=tuple(egress.get("rules", data.get("egress_rules")) or ()),
+            egress_tls_interception_enabled=_as_bool(
+                tls_interception.get(
+                    "enabled", data.get("egress_tls_interception_enabled")
+                ),
+                default=False,
+            ),
+            egress_tls_on_handshake_failure=str(
+                tls_interception.get(
+                    "on_handshake_failure",
+                    data.get("egress_tls_on_handshake_failure"),
+                )
+                or "passthrough"
+            ),
+            egress_tls_bypass_hosts=tuple(
+                tls_interception.get(
+                    "bypass_hosts", data.get("egress_tls_bypass_hosts")
+                )
+                or ()
+            ),
+            enable_egress_recording=_as_bool(
+                recording.get("enabled", data.get("enable_egress_recording")),
+                default=False,
+            ),
+            egress_recording_max_body_bytes=_as_int(
+                recording.get("max_body_bytes", data.get("egress_recording_max_body_bytes")),
+                default=1024 * 1024,
+            )
+            or 1024 * 1024,
+            egress_recording_record_errors=_as_bool(
+                recording.get("record_errors", data.get("egress_recording_record_errors")),
+                default=False,
+            ),
+            egress_recording_varying_headers=tuple(
+                recording.get(
+                    "varying_headers", data.get("egress_recording_varying_headers")
+                )
+                or ("accept", "accept-encoding")
+            ),
+            egress_recording_record_partial=_as_bool(
+                recording.get("record_partial", data.get("egress_recording_record_partial")),
+                default=False,
+            ),
+            effects_default_policy=str(
+                effects.get("default_policy", data.get("effects_default_policy")) or "allow"
+            ),
+            effects_fork_policy=str(
+                effects.get("fork_policy", data.get("effects_fork_policy")) or "reject"
+            ),
+            effects_standalone_fork_policy=str(
+                effects.get(
+                    "standalone_fork_policy", data.get("effects_standalone_fork_policy")
+                )
+                or "allow"
+            ),
+            effects_rules=tuple(effects.get("rules", data.get("effects_rules")) or ()),
+            effects_on_unlisted=str(
+                effects.get("on_unlisted", data.get("effects_on_unlisted")) or "reject"
+            ),
+            effects_opaque_effects=str(
+                effects.get("opaque_effects", data.get("effects_opaque_effects")) or "allow"
+            ),
+            effects_max_queue_bytes=_as_int(
+                effects.get("max_queue_bytes", data.get("effects_max_queue_bytes")),
+                default=16 * 1024 * 1024,
+            )
+            or 16 * 1024 * 1024,
+            effects_max_queue_entries=_as_int(
+                effects.get("max_queue_entries", data.get("effects_max_queue_entries")),
+                default=256,
+            )
+            or 256,
             network_expected_sandboxes=_as_int(
                 network.get("expected_sandboxes", data.get("network_expected_sandboxes")),
                 default=None,
@@ -520,14 +822,81 @@ class EngineConfig:
             runc_paths=runc_paths,
             zfs_dataset_prefix=(
                 None
-                if data.get("zfs_dataset_prefix") is None
-                else str(data.get("zfs_dataset_prefix")).rstrip("/")
+                if data.get("zfs_dataset_prefix", zfs_data.get("dataset_prefix")) is None
+                else str(data.get("zfs_dataset_prefix", zfs_data.get("dataset_prefix"))).rstrip("/")
+            ),
+            filesystem_backend=str(
+                filesystem_data.get("backend", data.get("filesystem_backend", "zfs"))
+            ).strip().lower(),
+            btrfs_root=_resolve_config_path(
+                btrfs_data.get("root", data.get("btrfs_root")),
+                base_dir=config_base_dir,
+            ),
+            overlay_root=_resolve_config_path(
+                overlay_data.get("root", data.get("overlay_root")),
+                base_dir=config_base_dir,
+            ),
+            btrfs_qgroups_enabled=_as_bool(
+                btrfs_data.get("qgroups_enabled", data.get("btrfs_qgroups_enabled")),
+                default=False,
             ),
             runtime_root=runtime_root,
             image_cache_root=image_cache_root,
             work_dir_host_root=work_dir_host_root,
             agent_state_root=agent_state_root,
             default_image=str(data.get("default_image", "ubuntu:22.04")),
+            image_pull_policy=str(
+                images.get("pull_policy", data.get("image_pull_policy"))
+                or "if-not-present"
+            ).strip().lower(),
+            image_allowed_registries=_as_string_tuple(
+                images.get(
+                    "allowed_registries", data.get("image_allowed_registries")
+                ),
+                default=("docker.io",),
+                label="images.allowed_registries",
+            ),
+            image_allowed_references=_as_string_tuple(
+                images.get(
+                    "allowed_references", data.get("image_allowed_references")
+                ),
+                label="images.allowed_references",
+            ),
+            image_pull_timeout_seconds=_as_float(
+                images.get(
+                    "pull_timeout_seconds", data.get("image_pull_timeout_seconds")
+                ),
+                default=600.0,
+            ),
+            image_max_bytes=_as_int(
+                images.get("max_image_bytes", data.get("image_max_bytes")),
+                default=8 * 1024 * 1024 * 1024,
+            ),
+            image_cache_max_bytes=_as_int(
+                images.get("cache_max_bytes", data.get("image_cache_max_bytes")),
+                default=20 * 1024 * 1024 * 1024,
+            ),
+            image_min_free_bytes=_as_int(
+                images.get("min_free_bytes", data.get("image_min_free_bytes")),
+                default=2 * 1024 * 1024 * 1024,
+            ),
+            image_cache_retention_seconds=_as_float(
+                images.get(
+                    "cache_retention_seconds",
+                    data.get("image_cache_retention_seconds"),
+                ),
+                default=30 * 24 * 60 * 60,
+            ),
+            image_prewarm=_as_string_tuple(
+                images.get("prewarm", data.get("image_prewarm")),
+                label="images.prewarm",
+            ),
+            image_prewarm_required=_as_string_tuple(
+                images.get(
+                    "required_prewarm", data.get("image_prewarm_required")
+                ),
+                label="images.required_prewarm",
+            ),
             scheduler_config=scheduler_config,
             executor_config=executor_config,
             telemetry_config=telemetry_config,
@@ -552,6 +921,18 @@ class EngineConfig:
                     "forwarder",
                     "host_inspector",
                     "image_cache_root",
+                    "image_allowed_references",
+                    "image_allowed_registries",
+                    "image_cache_max_bytes",
+                    "image_cache_retention_seconds",
+                    "image_max_bytes",
+                    "image_min_free_bytes",
+                    "image_prewarm",
+                    "image_prewarm_required",
+                    "image_pull_policy",
+                    "image_pull_timeout_seconds",
+                    "image_policy",
+                    "images",
                     "interceptor",
                     "interceptor_host",
                     "interceptor_port",
@@ -576,6 +957,30 @@ class EngineConfig:
                 }
             },
         )
+
+
+def resolve_sandbox_network_mode(
+    config: EngineConfig,
+    *,
+    runtime_name: str,
+    requested: bool | None,
+) -> bool:
+    """Resolve the public tri-state sandbox ``network`` contract.
+
+    Explicit true/false always wins. Omission uses an isolated namespace for
+    runc whenever the daemon has sandbox networking enabled. This keeps host
+    networking an explicit opt-out instead of coupling the security boundary
+    to optional interception features.
+    """
+
+    if requested is not None:
+        if not isinstance(requested, bool):
+            raise ValueError("network must be true, false, or null")
+        return requested
+    return bool(
+        runtime_name == "runc"
+        and config.enable_sandbox_network
+    )
 
 
 class Engine:
@@ -613,12 +1018,15 @@ class Engine:
         self._forwarder_thread: threading.Thread | None = None
         self._forwarder_base_url: str | None = None
         self._network_manager = None
+        self._egress_proxy: Any = None
+        self._tls_interceptor_ref: object | None = None
         self._host_inspector_client: HostInspectorServiceClient | None = None
         self._host_inspector_process: subprocess.Popen[str] | None = None
         self._host_inspector_server: Any = None
         self._host_inspector_process_log_path: Path | None = None
         self._sandboxes: "dict[SandboxId, Sandbox]" = {}
         self._sandbox_lock = threading.Lock()
+        self._image_prewarm_thread: threading.Thread | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -644,22 +1052,56 @@ class Engine:
         cls,
         socket: str | os.PathLike[str] | None = None,
         *,
+        url: str | None = None,
+        api_key: str | None = None,
         timeout_seconds: float = 30.0,
     ) -> "Engine":
-        """Connect to a running Crab daemon and return a `RemoteEngine`.
+        """Connect to a running Crab daemon (or gateway) — returns a `RemoteEngine`.
 
         The returned object exposes the same attribute surface SDK code
         already reads from a local Engine (`.runtime`, `.config`,
         `.storage_root` and friends, `.register_upstream`, …) — it just
-        translates each call into one of the daemon's HTTP-over-Unix-socket
-        endpoints. Returned as `Engine` for static-typing convenience;
-        the runtime type is `crab.remote_engine.RemoteEngine`.
+        translates each call into the daemon's HTTP endpoints. Returned
+        as `Engine` for static-typing convenience; the runtime type is
+        `crab.remote_engine.RemoteEngine`.
 
-        `socket` defaults to `default_socket_path()` from
-        `crab.daemon`. The daemon must already be running — start it
-        with `crab daemon start` (or `python -m crab.daemon`)."""
-        from .daemon import DaemonClient
+        Two modes, dispatched on argument shape:
+
+        - **Local daemon** (default): `socket` is a Unix-socket path,
+          defaulting to `default_socket_path()` from `crab.daemon`. The
+          daemon must already be running — start it with
+          `crab daemon start` (or `python -m crab.daemon`).
+        - **Cloud**: pass `url="https://gateway.example.com"` (or give an
+          `http(s)://` string as the first positional argument) plus
+          `api_key=` — or set `$CRAB_API_KEY`. Requests travel over TCP
+          to a crab-gateway's `/v1` API with Bearer auth; gateway errors
+          surface as the typed exceptions in `crab.cloud_client`."""
         from .remote_engine import RemoteEngine
+
+        # Shape dispatch: an http(s):// string in the positional slot is
+        # a gateway URL, not a socket path.
+        if url is None and isinstance(socket, str) and socket.startswith(
+            ("http://", "https://")
+        ):
+            url, socket = socket, None
+        if url is not None:
+            if socket is not None:
+                raise ValueError("pass either socket= or url=, not both")
+            from .cloud_client import CloudClient, CloudConnectionError, CloudRequestError
+
+            cloud = CloudClient(url, api_key, timeout_seconds=timeout_seconds)
+            try:
+                info = cloud.get_json("/info")
+            except (CloudRequestError, CloudConnectionError):
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"failed to connect to crab gateway at {cloud.base_url}: {exc}"
+                ) from exc
+            return RemoteEngine(cloud, info=info)  # type: ignore[return-value]
+        if api_key is not None:
+            raise ValueError("api_key= is only meaningful with url= (cloud mode)")
+        from .daemon import DaemonClient
 
         client = DaemonClient(socket, timeout_seconds=timeout_seconds)
         try:
@@ -680,6 +1122,22 @@ class Engine:
                 return
             cfg = self._config
             self._configure_logging(cfg)
+            if cfg.image_pull_policy not in {"if-not-present", "never"}:
+                raise ValueError(
+                    "images.pull_policy must be 'if-not-present' or 'never'"
+                )
+            for label, value in (
+                ("images.pull_timeout_seconds", cfg.image_pull_timeout_seconds),
+                ("images.max_image_bytes", cfg.image_max_bytes),
+                ("images.cache_max_bytes", cfg.image_cache_max_bytes),
+                ("images.min_free_bytes", cfg.image_min_free_bytes),
+                (
+                    "images.cache_retention_seconds",
+                    cfg.image_cache_retention_seconds,
+                ),
+            ):
+                if float(value) <= 0:
+                    raise ValueError(f"{label} must be positive, got {value}")
             storage_root = cfg.storage_root
             if storage_root is None:
                 self._tempdir = tempfile.TemporaryDirectory(prefix="crab-engine-")
@@ -705,14 +1163,32 @@ class Engine:
             ):
                 path.mkdir(parents=True, exist_ok=True)
 
+            if cfg.enable_egress_recording and not cfg.enable_egress_proxy:
+                raise RuntimeError(
+                    "enable_egress_recording requires enable_egress_proxy=True "
+                    "(the proxy is what sees the exchanges)"
+                )
+            if cfg.enable_egress_proxy and not cfg.enable_action_journal:
+                # The journal is the effect ledger's only store: without it
+                # the proxy would forward every flow and record none, which
+                # looks exactly like working interception.
+                raise RuntimeError(
+                    "enable_egress_proxy requires enable_action_journal=True "
+                    "(the journal is the effect ledger's only store)"
+                )
             if cfg.runtime == "runc" and cfg.enable_sandbox_network:
                 from integrations.sandboxes.runtime.network import BenchmarkNetworkManager
 
                 network_manager = BenchmarkNetworkManager()
                 network_manager.configure(expected_sandboxes=cfg.network_expected_sandboxes)
-                if cfg.enable_interceptor:
+                if cfg.enable_interceptor or cfg.enable_egress_proxy:
                     network_manager.ensure_bridge()
                 self._network_manager = network_manager
+            elif cfg.enable_egress_proxy:
+                raise RuntimeError(
+                    "enable_egress_proxy requires runtime='runc' with "
+                    "enable_sandbox_network=True (the bridge is the redirect hook point)"
+                )
 
             if cfg.runtime == "runc":
                 self._start_host_inspector_if_configured()
@@ -780,8 +1256,148 @@ class Engine:
                     storage_root,
                 )
 
+            if cfg.enable_egress_proxy:
+                # All sandbox TCP egress lands here (bridge REDIRECT);
+                # host-bound flows are excluded by the rule, so the
+                # interceptor path above is untouched.
+                from .egress import CassetteRecorder, EgressProxyServer, EgressRule
+
+                manager = self._network_manager
+                assert manager is not None  # guarded above
+                rules = tuple(
+                    rule if isinstance(rule, EgressRule) else EgressRule.from_json(dict(rule))
+                    for rule in cfg.egress_rules
+                )
+                cassette_recorder = None
+                cassette_replayer = None
+                if cfg.enable_egress_recording:
+                    from .cassettes import CassetteStore
+                    from .egress import CassetteReplayer
+
+                    storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
+                    store = CassetteStore(
+                        Path(storage_cfg.root_dir) / storage_cfg.cassettes_dirname
+                    )
+                    cassette_recorder = CassetteRecorder(
+                        store,
+                        max_body_bytes=cfg.egress_recording_max_body_bytes,
+                        record_errors=cfg.egress_recording_record_errors,
+                        record_partial=cfg.egress_recording_record_partial,
+                        varying_headers=cfg.egress_recording_varying_headers,
+                    )
+                    cassette_replayer = CassetteReplayer(store)
+                    # The system owns both for replay windows (D2) and for
+                    # pruning a sandbox's cassettes when it is destroyed.
+                    self._system.cassette_store = store
+                    self._system.cassette_replayer = cassette_replayer
+                from .effects import EffectGate
+
+                effect_gate = EffectGate()
+                self._system.effect_gate = effect_gate
+                self._system.effect_policy_defaults = {
+                    "default_policy": cfg.effects_default_policy,
+                    "fork_policy": cfg.effects_fork_policy,
+                    "standalone_fork_policy": cfg.effects_standalone_fork_policy,
+                    "on_unlisted": cfg.effects_on_unlisted,
+                    "opaque_effects": cfg.effects_opaque_effects,
+                    "rules": cfg.effects_rules,
+                    "max_queue_bytes": cfg.effects_max_queue_bytes,
+                    "max_queue_entries": cfg.effects_max_queue_entries,
+                }
+                proxy = EgressProxyServer(
+                    journal=getattr(self._system, "journal", None),
+                    sandbox_id_resolver=manager.resolve_sandbox_id,
+                    # REDIRECT rewrites the destination to the bridge's own
+                    # address, so binding there catches every redirected
+                    # flow without exposing the proxy on other interfaces.
+                    host=manager.bridge_ip,
+                    port=cfg.egress_proxy_port,
+                    rules=rules,
+                    cassette_recorder=cassette_recorder,
+                    cassette_replayer=cassette_replayer,
+                    replay_varying_headers=cfg.egress_recording_varying_headers,
+                    effect_gate=effect_gate,
+                    tls_interceptor=_build_tls_interceptor(cfg),
+                )
+                self._tls_interceptor_ref = proxy.tls_interceptor
+                proxy.start()
+                manager.enable_egress_redirect(proxy.port)
+                # A previous run's deferred queue did not survive; close out
+                # its journal rows so nothing looks pending forever.
+                try:
+                    self._system.backfill_lost_effects()
+                except Exception:
+                    logger.debug("Lost-effect backfill failed", exc_info=True)
+                # The ledger re-derives classification when read, so the
+                # query side needs the same rules as the recording side.
+                self._system.egress_rules = rules
+                self._egress_proxy = proxy
+                logger.info("Egress interception active: proxy_port=%d", proxy.port)
+
+            for reference in cfg.image_prewarm_required:
+                self._prewarm_image(reference)
             self._system.start()
             self._started = True
+            optional_prewarm = tuple(
+                reference
+                for reference in cfg.image_prewarm
+                if reference not in set(cfg.image_prewarm_required)
+            )
+            if optional_prewarm:
+                self._image_prewarm_thread = threading.Thread(
+                    target=self._prewarm_images_best_effort,
+                    args=(optional_prewarm,),
+                    daemon=True,
+                    name="crab-image-prewarm",
+                )
+                self._image_prewarm_thread.start()
+
+    def _prewarm_images_best_effort(self, references: tuple[str, ...]) -> None:
+        for reference in references:
+            try:
+                self._prewarm_image(reference)
+            except Exception:
+                logger.exception("Optional image prewarm failed: %s", reference)
+
+    def _prewarm_image(self, reference: str) -> None:
+        from integrations.sandboxes.runtime import image as sandbox_image
+
+        cfg = self.config
+        resolved = sandbox_image.resolve_image(
+            reference=reference,
+            cache_root=self.image_cache_root,
+            pull_policy=cfg.image_pull_policy,
+            allowed_registries=cfg.image_allowed_registries,
+            allowed_references=cfg.image_allowed_references,
+            pull_timeout_seconds=cfg.image_pull_timeout_seconds,
+            max_image_bytes=cfg.image_max_bytes,
+            min_free_bytes=cfg.image_min_free_bytes,
+            telemetry=self.system.telemetry,
+        )
+        sandbox_image.inspect_image_runtime_defaults(
+            tag=resolved.normalized_reference,
+            cache_root=self.image_cache_root,
+            telemetry=self.system.telemetry,
+            image_id=resolved.image_id,
+        )
+        sandbox_image.export_image_rootfs(
+            tag=resolved.normalized_reference,
+            output_dir=self.image_cache_root / resolved.image_id,
+            cache_root=self.image_cache_root,
+            telemetry=self.system.telemetry,
+            image_id=resolved.image_id,
+            image_size_bytes=resolved.size_bytes,
+            max_image_bytes=cfg.image_max_bytes,
+            cache_max_bytes=cfg.image_cache_max_bytes,
+            min_free_bytes=cfg.image_min_free_bytes,
+            cache_retention_seconds=cfg.image_cache_retention_seconds,
+        )
+        logger.info(
+            "Image prewarm ready: reference=%s digest=%s image_id=%s",
+            resolved.normalized_reference,
+            resolved.digest,
+            resolved.image_id,
+        )
 
     def _configure_logging(self, cfg: EngineConfig) -> None:
         if cfg.log_file is None and not cfg.log_level:
@@ -819,14 +1435,40 @@ class Engine:
         cfg = self._config
         assert self._request_state_store is not None
         assert self._runtime_root is not None
+        backend = cfg.filesystem_backend.strip().lower()
+        if backend not in {"zfs", "btrfs", "overlay"}:
+            raise ValueError(
+                f"unsupported filesystem_backend: {cfg.filesystem_backend!r} "
+                "(expected 'zfs', 'btrfs' or 'overlay')"
+            )
+        btrfs_root = cfg.btrfs_root or RuncRuntimePaths().btrfs_root
+        overlay_root = cfg.overlay_root or btrfs_root / "overlay"
         paths = cfg.runc_paths or RuncRuntimePaths(
             state_root=self._runtime_root / "runtime-state",
             bundle_root=self._runtime_root / "bundles",
             checkpoint_root=self._runtime_root / "checkpoints",
             metadata_root=self._runtime_root / "sandbox-meta",
-            zfs_dataset_prefix=self._resolve_zfs_dataset_prefix(),
+            zfs_dataset_prefix=(
+                ZfsProvider.resolve_dataset_prefix(cfg.zfs_dataset_prefix)
+                if backend == "zfs"
+                else RuncRuntimePaths().zfs_dataset_prefix
+            ),
+            btrfs_root=btrfs_root,
+            overlay_root=overlay_root,
         )
-        self._ensure_zfs_parent_dataset(paths.zfs_dataset_prefix)
+        if backend == "zfs":
+            ZfsProvider.ensure_parent_dataset(paths.zfs_dataset_prefix)
+        elif backend == "btrfs":
+            BtrfsProvider.ensure_root(paths.btrfs_root)
+        else:
+            OverlayProvider.ensure_root(paths.overlay_root or paths.btrfs_root / "overlay")
+        runc_options = cfg.runc_options or RuncRuntimeOptions()
+        if runc_options.filesystem_backend != backend or runc_options.btrfs_qgroups_enabled != cfg.btrfs_qgroups_enabled:
+            runc_options = replace(
+                runc_options,
+                filesystem_backend=backend,
+                btrfs_qgroups_enabled=cfg.btrfs_qgroups_enabled,
+            )
         telemetry_cfg = cfg.telemetry_config or TelemetryConfig(enabled=True)
         telemetry = build_configured_telemetry_sink(
             telemetry_cfg,
@@ -835,14 +1477,21 @@ class Engine:
         )
         runtime = RuncRuntime(
             paths=paths,
-            options=cfg.runc_options,
+            options=runc_options,
             telemetry=telemetry,
             host_inspector_client=self._host_inspector_client,
         )
         storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
+        journal = None
+        if cfg.enable_action_journal:
+            journal = ActionJournal(storage_cfg.root_dir / storage_cfg.journal_dirname)
+            # The runtime records exec attempts + launch markers itself; the
+            # system records checkpoint/restore/fork/destroy markers.
+            runtime.action_recorder = journal
         storage = LocalCheckpointManager(
             storage_cfg,
             runtime_image_path_in_use=runtime.runtime_image_path_in_use,
+            destroy_filesystem_ref=runtime.destroy_filesystem_ref,
         )
         if self._host_inspector_client is not None:
             base_inspector = RemoteSandboxInspector(
@@ -877,7 +1526,7 @@ class Engine:
         )
         response_gate_registry = SandboxResponseGateRegistry()
         scheduler_cfg = cfg.scheduler_config or SchedulerConfig()
-        return CrabSystem(
+        system = CrabSystem(
             scheduler=CRScheduler(
                 scheduler_cfg,
                 inspector,
@@ -893,7 +1542,17 @@ class Engine:
             telemetry=telemetry,
             request_state_store=self._request_state_store,
             response_gate_registry=response_gate_registry,
+            journal=journal,
         )
+        # Fork-backed txns (B3) need engine-level machinery (lease
+        # allocation, bundle replication, restore, kill-path teardown).
+        system.configure_fork_txn_hooks(
+            fork=self._fork_for_txn,
+            destroy=self._destroy_txn_fork,
+            lease_repair=self.repair_network_lease,
+            lease_transfer=self.transfer_network_lease,
+        )
+        return system
 
     def _start_host_inspector_if_configured(self) -> None:
         cfg = self._config
@@ -1067,48 +1726,6 @@ class Engine:
         bridge_ip = getattr(manager, "bridge_ip", None)
         return str(bridge_ip) if bridge_ip else configured_host
 
-    def _resolve_zfs_dataset_prefix(self) -> str:
-        cfg = self._config
-        if cfg.zfs_dataset_prefix:
-            return cfg.zfs_dataset_prefix.rstrip("/")
-        env_prefix = os.environ.get("CRAB_ZFS_DATASET_PREFIX", "").strip()
-        if env_prefix:
-            return env_prefix.rstrip("/")
-        env_pool = os.environ.get("CRAB_ZPOOL_NAME", "").strip()
-        if env_pool:
-            return f"{env_pool}/crab-sdk"
-        try:
-            result = subprocess.run(
-                ["zpool", "list", "-H", "-o", "name"],
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        except OSError:
-            return "crab/crab-sdk"
-        pools = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        for pool in pools:
-            if pool.startswith("crab"):
-                return f"{pool}/crab-sdk"
-        return f"{pools[0]}/crab-sdk" if pools else "crab/crab-sdk"
-
-    def _ensure_zfs_parent_dataset(self, dataset_prefix: str) -> None:
-        parts = [part for part in dataset_prefix.strip("/").split("/") if part]
-        if len(parts) < 2:
-            return
-        current = parts[0]
-        for part in parts[1:]:
-            current = f"{current}/{part}"
-            exists = subprocess.run(
-                ["zfs", "list", "-H", "-o", "name", current],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            ).returncode == 0
-            if exists:
-                continue
-            subprocess.run(["zfs", "create", current], check=True)
-
     def stop(self) -> None:
         with self._lock:
             if not self._started:
@@ -1122,6 +1739,17 @@ class Engine:
             except Exception:
                 logger.debug("Best-effort sandbox kill failed during engine stop", exc_info=True)
         with self._lock:
+            if self._egress_proxy is not None:
+                if self._network_manager is not None:
+                    try:
+                        self._network_manager.disable_egress_redirect()
+                    except Exception:
+                        logger.exception("Egress redirect teardown failed")
+                try:
+                    self._egress_proxy.stop()
+                except Exception:
+                    logger.exception("Egress proxy stop failed")
+                self._egress_proxy = None
             if self._interceptor is not None:
                 try:
                     self._interceptor.stop()
@@ -1227,6 +1855,38 @@ class Engine:
             return None
         return self._interceptor.base_url
 
+    def list_sandboxes(self) -> list[dict[str, Any]]:
+        """Return the engine's registered sandboxes as raw dicts.
+
+        Mirrors :meth:`RemoteEngine.list_sandboxes` so callers can rely on
+        the same shape (``sandbox_id`` / ``runtime_name`` / ``status`` /
+        ``metadata``) regardless of transport."""
+        with self._lock:
+            sandboxes = list(self._sandboxes.values())
+        rows: list[dict[str, Any]] = []
+        for sbx in sandboxes:
+            sid = sbx.sandbox_id
+            if sid is None:
+                continue
+            try:
+                description = self.runtime.describe(sid)
+                status = description.status
+                runtime_name = description.runtime_name
+                metadata = dict(getattr(description, "metadata", {}) or {})
+            except Exception:
+                status = "unknown"
+                runtime_name = self.runtime.name if self._runtime is not None else ""
+                metadata = {}
+            rows.append(
+                {
+                    "sandbox_id": str(sid),
+                    "runtime_name": runtime_name,
+                    "status": status,
+                    "metadata": metadata,
+                }
+            )
+        return rows
+
     # ------------------------------------------------------------------
     # Per-sandbox upstream URL bookkeeping (delegates to the SDK forwarder
     # so the per-sandbox routing lives in one place — same architectural
@@ -1290,11 +1950,10 @@ class Engine:
                 if isinstance(value, str) and value == client_host:
                     return str(sandbox.sandbox_id)
 
-        # SDK runc sandboxes currently default to host networking unless the
-        # caller supplies a network namespace. That makes the HTTP peer
-        # 127.0.0.1 for all in-sandbox agents, so fall back to the single
-        # registered upstream case. Multi-sandbox LLM routing should use an
-        # explicit header or per-sandbox network identity.
+        # An explicit host-network opt-out makes the HTTP peer 127.0.0.1 for
+        # every such in-sandbox agent, so fall back to the single registered
+        # upstream case. Multi-sandbox LLM routing must keep the default
+        # per-sandbox network identity or use an explicit header.
         registered = [
             sandbox
             for sandbox in sandboxes
@@ -1303,6 +1962,25 @@ class Engine:
         if len(registered) == 1:
             return str(registered[0].sandbox_id)
         return None
+
+    @property
+    def tls_ca_cert_path(self) -> Path | None:
+        """Host path to the CA certificate when TLS interception is active.
+
+        Returns None when interception is disabled or the engine has not
+        started.  Sandbox trust injection uses this to copy the cert into
+        the rootfs and derive the env overlay.  No cryptography import
+        occurs here — the path is read from the already-constructed
+        TLSInterceptor's CAStore.
+        """
+        ti = self._tls_interceptor_ref
+        if ti is None:
+            return None
+        # ti is a TLSInterceptor; access .ca_store.cert_path
+        try:
+            return Path(ti.ca_store.cert_path)
+        except (AttributeError, TypeError):
+            return None
 
     @property
     def forwarder_base_url(self) -> str | None:
@@ -1326,7 +2004,9 @@ class Engine:
         manager.register_guest_ip(lease.guest_ip, sandbox_id)
         return lease
 
-    def release_network_lease(self, sandbox_id: SandboxId) -> None:
+    def release_network_lease(
+        self, sandbox_id: SandboxId, *, strict: bool = False
+    ) -> None:
         manager = self._network_manager
         if manager is None:
             return
@@ -1334,6 +2014,8 @@ class Engine:
             manager.release_lease(sandbox_id)
         except Exception:
             logger.exception("Failed to release sandbox network lease: %s", sandbox_id)
+            if strict:
+                raise
 
     def repair_network_lease(self, sandbox_id: SandboxId) -> bool:
         manager = self._network_manager
@@ -1344,6 +2026,325 @@ class Engine:
         except Exception:
             logger.exception("Failed to repair sandbox network lease: %s", sandbox_id)
             return False
+
+    def transfer_network_lease(
+        self,
+        from_sandbox_id: SandboxId,
+        to_sandbox_id: SandboxId,
+        *,
+        probe: bool = False,
+    ) -> bool:
+        """Move a fork's network identity onto the source it is promoted into.
+
+        Three things have to move together, which is why this is one call:
+        the lease itself (so the address still exists), the target's bundle
+        `netns` path (so runc restores into the namespace the image was
+        dumped in), and the target's runtime metadata (so the interceptor's
+        attribution fallback and `Sandbox.get_host` stop serving the dead
+        address). Returns False when there is nothing to transfer, which
+        tells the caller to keep the `repair_network_lease` path.
+
+        With ``probe=True`` nothing is mutated and the return value only
+        answers "would a transfer happen?" — the promotion needs that before
+        it dumps the fork, because a transferred netns requires the fork's
+        processes to leave it. The probe swallows its own errors (a
+        pre-flight must not abort the promotion); the real call does not,
+        because by then the fork is dumped-and-stopped and a silent False
+        would send the caller down the repair path with a stopped fork and
+        an image bound to the fork's address.
+        """
+        manager = self._network_manager
+        if manager is None:
+            return False
+        if probe:
+            try:
+                return manager.lease_for(from_sandbox_id) is not None
+            except Exception:
+                logger.exception("Failed to probe sandbox network lease: %s", from_sandbox_id)
+                return False
+        lease = manager.transfer_lease(from_sandbox_id, to_sandbox_id)
+        if lease is None:
+            # The probe already confirmed a lease before the fork was
+            # dumped, so None here means it vanished mid-promotion. The
+            # fork is stopped and its image carries the fork's address;
+            # falling back to repair would restore it into the wrong netns.
+            # Surface it so _promote_fork_onto_source raises with the cause.
+            raise RuntimeError(
+                f"network lease for {from_sandbox_id} vanished between the "
+                "promotion pre-flight and the transfer"
+            )
+        netns_path = str(lease.namespace_path)
+        forking.retarget_bundle_network_namespace(
+            self.runtime.bundle_path_for(to_sandbox_id), netns_path
+        )
+        update_metadata = getattr(self.runtime, "update_network_metadata", None)
+        if update_metadata is not None:
+            try:
+                update_metadata(
+                    to_sandbox_id,
+                    guest_ip=str(lease.guest_ip),
+                    network_namespace_path=netns_path,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to refresh network metadata after lease transfer sandbox=%s",
+                    to_sandbox_id,
+                )
+        return True
+
+    def fork_sandbox(
+        self,
+        source_sandbox_id: SandboxId,
+        *,
+        count: int = 1,
+        lazy: bool = False,
+        effects: str | None = None,
+        gate_effects: bool = True,
+        checkpoint_id: CheckpointId | None = None,
+    ) -> list[SandboxId]:
+        """Fork a running sandbox `count` times via checkpoint+restore.
+
+        Each fork gets its own bundle (source config.json copied with
+        per-sandbox path rewrites), its own network lease when networking
+        is enabled, a checkpoint-state clone (CrabSystem.fork_once, with
+        incremental chain sharing when available), and a process restore —
+        lazily via CRIU lazy-pages when ``lazy=True``.
+
+        ``checkpoint_id`` names an existing checkpoint of the source as the
+        fork point instead of taking a fresh one; the whole batch then
+        branches from that single point, and the source is left as it is
+        (forking from a past checkpoint never restores it).
+
+        ``effects`` is the bare-fork effect policy (F1); it is resolved and
+        validated once, before any fork exists, so a bad value cannot leave
+        half a fleet behind. ``gate_effects=False`` is for callers that own
+        the effect window themselves — a fork-backed transaction arms its
+        own session on the fork (D3), and must not be given a standalone one
+        on top of it.
+        """
+        if count < 1:
+            raise ValueError("fork count must be >= 1")
+        system = self.system
+        fork_effect_policy: str | None = None
+        if gate_effects:
+            # Validate before anything is created (F1): a rejected policy
+            # must not leave forks behind.
+            fork_effect_policy = system.validate_standalone_fork_policy(effects)
+        elif effects is not None:
+            raise ValueError(
+                "effects= is not accepted when the caller owns the effect window"
+            )
+        runtime = self.runtime
+        source_bundle = runtime.bundle_path_for(source_sandbox_id)
+        source_config_path = source_bundle / "config.json"
+        paths = getattr(runtime, "paths", None)
+        if paths is None:
+            raise RuntimeError("fork is only supported on the runc runtime")
+        if checkpoint_id is not None and checkpoint_id not in system.storage.list_checkpoints(
+            source_sandbox_id
+        ):
+            # Same reason the effect policy is validated up front: a bad id
+            # must not leave a bundle and a network lease behind.
+            raise ValueError(
+                f"checkpoint {checkpoint_id} not found for sandbox {source_sandbox_id}"
+            )
+
+        try:
+            source_description = runtime.describe(source_sandbox_id)
+            source_network_metadata = dict(source_description.metadata or {})
+        except (AttributeError, KeyError):
+            # Older/in-memory Runtime test doubles have no persistent
+            # description. They are necessarily host-networked because they
+            # also have no concrete network namespace to inherit.
+            source_network_metadata = {}
+        source_network_mode = str(
+            source_network_metadata.get("network_mode") or ""
+        ).strip().lower()
+        source_has_isolated_network = source_network_mode == "isolated" or bool(
+            source_network_metadata.get("network_namespace_path")
+        )
+        if not source_has_isolated_network:
+            # Metadata added before this release may not carry network_mode.
+            # The copied OCI config remains authoritative for a live legacy
+            # sandbox, so do not accidentally turn its fork into host mode.
+            try:
+                source_config = json.loads(
+                    source_config_path.read_text(encoding="utf-8")
+                )
+                namespaces = (source_config.get("linux") or {}).get(
+                    "namespaces", []
+                )
+                source_has_isolated_network = any(
+                    isinstance(item, dict) and item.get("type") == "network"
+                    for item in namespaces
+                )
+            except (FileNotFoundError, OSError, json.JSONDecodeError, AttributeError):
+                pass
+
+        fork_ids: list[SandboxId] = []
+        for _ in range(count):
+            target_sandbox_id = SandboxId(f"{source_sandbox_id}-fork-{uuid.uuid4().hex[:8]}")
+            target_bundle = paths.bundle_root / str(target_sandbox_id)
+            try:
+                target_bundle.mkdir(parents=True, exist_ok=True)
+                if source_config_path.is_file():
+                    shutil.copy2(source_config_path, target_bundle / "config.json")
+                forking.replicate_bundle_config(
+                    source_bundle,
+                    target_bundle,
+                    source_sandbox_id,
+                    target_sandbox_id,
+                )
+                lease = None
+                if source_has_isolated_network:
+                    if self._network_manager is None:
+                        raise RuntimeError(
+                            f"fork source {source_sandbox_id} uses an isolated network, "
+                            "but the network manager is unavailable"
+                        )
+                    lease = self.allocate_network_lease(target_sandbox_id)
+                    # The spec was copied from the source, so it still names
+                    # the source's netns: without retargeting, the fork
+                    # shares the source's network stack and its egress is
+                    # attributed to the source.
+                    forking.retarget_bundle_network_namespace(
+                        target_bundle, str(lease.namespace_path)
+                    )
+
+                result = system.fork_once(
+                    source_sandbox_id,
+                    target_sandbox_id,
+                    checkpoint_id=checkpoint_id,
+                    target_rootfs_path=target_bundle / "rootfs",
+                )
+                if lease is not None:
+                    update_network_metadata = getattr(
+                        runtime, "update_network_metadata", None
+                    )
+                    if callable(update_network_metadata):
+                        update_network_metadata(
+                            target_sandbox_id,
+                            guest_ip=str(lease.guest_ip),
+                            network_namespace_path=str(lease.namespace_path),
+                        )
+                # Arm the gate before the fork's processes are restored: once
+                # they run, an ungated write could already be on the wire.
+                if fork_effect_policy is not None:
+                    system.arm_fork_effect_session(
+                        target_sandbox_id, fork_effect_policy
+                    )
+                restore_result = system.restore_once(
+                    target_sandbox_id,
+                    result.checkpoint_id,
+                    restore_metadata={"lazy_pages": True} if lazy else None,
+                )
+                if restore_result.status.value != "succeeded":
+                    raise RuntimeError(
+                        f"fork restore failed for {target_sandbox_id}: status={restore_result.status.value}"
+                    )
+                if lease is not None and not self.repair_network_lease(
+                    target_sandbox_id
+                ):
+                    raise RuntimeError(
+                        f"fork network lease repair failed for {target_sandbox_id}"
+                    )
+            except Exception as exc:
+                cleanup_errors: list[str] = []
+                for failed_id in reversed([*fork_ids, target_sandbox_id]):
+                    cleanup_errors.extend(self._cleanup_failed_fork(failed_id))
+                if cleanup_errors:
+                    raise SandboxCreateCleanupError(
+                        str(target_sandbox_id),
+                        exc,
+                        cleanup_errors,
+                        resources=tuple(str(item) for item in [*fork_ids, target_sandbox_id]),
+                    ) from exc
+                raise
+            fork_ids.append(target_sandbox_id)
+        return fork_ids
+
+    def _cleanup_failed_fork(self, sandbox_id: SandboxId) -> tuple[str, ...]:
+        errors: list[str] = []
+        # The effect gate is armed before restore.  Release it independently
+        # from fork bookkeeping so a missing/failed release_fork hook cannot
+        # leave a dead sandbox id gated forever.  The real EffectGate.end()
+        # path is idempotent, so release_fork may safely repeat this step.
+        release_effect_session = getattr(
+            self.system, "_release_effect_session", None
+        )
+        if callable(release_effect_session):
+            try:
+                release_effect_session(sandbox_id)
+            except Exception as exc:
+                errors.append(f"effect session {sandbox_id}: {exc}")
+        try:
+            self.system.release_fork(sandbox_id)
+        except Exception as exc:
+            errors.append(f"fork bookkeeping {sandbox_id}: {exc}")
+        try:
+            self.system.storage.delete_all_checkpoints(sandbox_id)
+        except Exception as exc:
+            errors.append(f"checkpoint storage {sandbox_id}: {exc}")
+        cleanup = getattr(self.runtime, "cleanup_failed_launch", None)
+        if callable(cleanup):
+            try:
+                errors.extend(cleanup(sandbox_id))
+            except Exception as exc:
+                errors.append(f"runtime cleanup {sandbox_id}: {exc}")
+        else:
+            try:
+                self.runtime.delete(sandbox_id)
+            except Exception as exc:
+                errors.append(f"runtime delete {sandbox_id}: {exc}")
+        try:
+            self.unregister_upstream(sandbox_id)
+        except Exception as exc:
+            errors.append(f"upstream {sandbox_id}: {exc}")
+        try:
+            self.release_network_lease(sandbox_id, strict=True)
+        except Exception as exc:
+            errors.append(f"network lease {sandbox_id}: {exc}")
+        return tuple(errors)
+
+    def _fork_for_txn(self, source_sandbox_id: SandboxId) -> SandboxId:
+        """Fork hook for fork-backed transactions (B3): one fork via the
+        standard pipeline, inspector seeded the way Sandbox.fork does
+        (there is no SDK Sandbox object on this path)."""
+        [fork_id] = self.fork_sandbox(source_sandbox_id, count=1, gate_effects=False)
+        try:
+            self.system.inspector.upsert_snapshot(
+                SandboxSnapshot(
+                    sandbox_id=fork_id,
+                    runtime_name=self.runtime.name,
+                    is_running=True,
+                    process_changed=False,
+                    filesystem_changed=False,
+                    observed_at=utc_now(),
+                )
+            )
+        except Exception:
+            logger.debug("Failed to seed inspector for txn fork=%s", fork_id, exc_info=True)
+        return fork_id
+
+    def _destroy_txn_fork(self, fork_sandbox_id: SandboxId) -> None:
+        """Teardown hook mirroring Sandbox.kill's fork cleanup chain —
+        each step independently best-effort."""
+        try:
+            self.system.release_fork(fork_sandbox_id)
+        except Exception:
+            logger.exception("Txn fork release failed fork=%s", fork_sandbox_id)
+        try:
+            self.runtime.delete(fork_sandbox_id)
+        except Exception:
+            logger.exception("Txn fork runtime delete failed fork=%s", fork_sandbox_id)
+        try:
+            self.unregister_upstream(fork_sandbox_id)
+        except Exception:
+            logger.debug("Txn fork upstream cleanup failed", exc_info=True)
+        try:
+            self.release_network_lease(fork_sandbox_id)
+        except Exception:
+            logger.debug("Txn fork lease cleanup failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Sandbox registry — used so engine.stop() can clean up.

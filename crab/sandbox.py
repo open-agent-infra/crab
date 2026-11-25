@@ -1925,13 +1925,20 @@ class Sandbox:
                     release(sandbox_id)
         except Exception:
             logger.exception("Fork bookkeeping failed during kill: id=%s", sandbox_id)
+        deleted = False
         try:
             self._engine.runtime.delete(sandbox_id)
+            deleted = True
         except Exception:
             logger.exception("Sandbox kill failed: id=%s", sandbox_id)
         finally:
-            self._engine.unregister_upstream(sandbox_id)
-            self._engine.release_network_lease(sandbox_id)
+            # In remote/cloud mode, DELETE /sandboxes/{id} already unregisters
+            # upstream and releases the network lease on the daemon (and marks
+            # the sandbox killed on the gateway), so issuing two follow-up
+            # DELETE calls would only incur redundant WAN round-trips that 404.
+            if not (deleted and self._is_remote_runtime(self._engine.runtime)):
+                self._engine.unregister_upstream(sandbox_id)
+                self._engine.release_network_lease(sandbox_id)
             self._engine._unregister_sandbox(self)
 
     def __enter__(self) -> "Sandbox":

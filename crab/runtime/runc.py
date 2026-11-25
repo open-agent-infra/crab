@@ -225,6 +225,11 @@ class RuncRuntimeOptions:
     # carry real overhead; default off (stats degrade to unknown). On
     # overlay the stats cover the upper subvolume only.
     btrfs_qgroups_enabled: bool = False
+    # Asynchronous ZFS dataset reaping (atomic rename into `<prefix>/.trash`
+    # + background `zfs destroy -r`). `None` enables async reaping when using
+    # the real SubprocessCommandRunner while keeping fake test CommandRunners
+    # synchronous unless explicitly opted in.
+    zfs_async_destroy: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -293,6 +298,11 @@ class RuncRuntime(Runtime):
                 qgroups_enabled=resolved_options.btrfs_qgroups_enabled,
             )
         elif resolved_options.filesystem_backend == "zfs":
+            async_destroy = (
+                isinstance(self._runner, SubprocessCommandRunner)
+                if resolved_options.zfs_async_destroy is None
+                else bool(resolved_options.zfs_async_destroy)
+            )
             self._fs = ZfsProvider(
                 dataset_prefix=self._paths.zfs_dataset_prefix,
                 runtime_name=self.name,
@@ -301,6 +311,7 @@ class RuncRuntime(Runtime):
                 dataset_resolver=self.dataset_name_for,
                 rootfs_resolver=self.rootfs_path_for,
                 zfs_bin=zfs_bin,
+                async_destroy=async_destroy,
             )
         else:
             raise ValueError(
@@ -2835,6 +2846,15 @@ class RuncRuntime(Runtime):
         if not dataset:
             dataset = self._fs.default_dataset_name(sandbox_id)
         self._fs.destroy_filesystem_dataset(sandbox_id, dataset)
+
+    def start_background_maintenance(self) -> None:
+        self._fs.sweep_trash_async()
+
+    def wait_for_pending_destroys(self, timeout: float = 30.0) -> bool:
+        return self._fs.wait_for_pending_destroys(timeout=timeout)
+
+    def close(self, timeout: float = 30.0) -> bool:
+        return self._fs.close(timeout=timeout)
 
     def destroy_filesystem_ref(self, fs_ref: str) -> None:
         self._fs.destroy_snapshot_ref(fs_ref)

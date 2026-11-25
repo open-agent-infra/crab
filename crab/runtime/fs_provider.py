@@ -246,3 +246,17 @@ class FilesystemProvider(ABC):
         binary itself. Refs the provider does not recognize and
         already-deleted snapshots must be tolerated (log, don't raise):
         retention is best-effort and must never wedge on cleanup."""
+
+    def sweep_trash_async(self) -> None:
+        """Schedule asynchronous reclamation of any leftover detached datasets
+        from a prior daemon run. No-op on synchronous backends."""
+
+    def wait_for_pending_destroys(self, timeout: float = 30.0) -> bool:
+        """Block up to ``timeout`` seconds for background dataset destroys to
+        drain. Returns True when idle, False on timeout."""
+        _ = timeout
+        return True
+
+    def close(self, timeout: float = 30.0) -> bool:
+        """Stop background maintenance workers after draining pending destroys."""
+        return self.wait_for_pending_destroys(timeout=timeout)

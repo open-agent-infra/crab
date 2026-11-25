@@ -53,7 +53,8 @@ jobs:
             tests.test_gateway_server \
             tests.test_cloud_client \
             tests.test_exec_streaming \
-            tests.test_port_proxy
+            tests.test_port_proxy \
+            tests.test_zfs_async_destroy
 
       - name: Run TLS tests
         if: matrix.extras == 'tls'

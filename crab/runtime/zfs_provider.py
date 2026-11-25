@@ -4,7 +4,10 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
+import uuid
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 
@@ -25,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 _DATASET_DESTROY_BUSY_RETRIES = 10
 _DATASET_DESTROY_BUSY_RETRY_DELAY_S = 0.5
+_DETACH_UNMOUNT_RETRIES = 3
+_DETACH_UNMOUNT_RETRY_DELAY_S = 0.025
+_TRASH_DIRNAME = ".trash"
 _DATASET_PROMOTE_CONFLICT_RETRIES = 8
 _PROMOTE_CONFLICTING_SNAPSHOT_RE = re.compile(r"conflicting snapshot '([^']+)'")
 _FS_REF_PREFIX = "zfs:"
@@ -118,18 +124,39 @@ class ZfsProvider(FilesystemProvider):
         dataset_resolver: DatasetResolver,
         rootfs_resolver: RootfsResolver,
         zfs_bin: str = "zfs",
+        async_destroy: bool = True,
     ) -> None:
         self._dataset_prefix = dataset_prefix
+        self._trash_prefix = f"{dataset_prefix.rstrip('/')}/{_TRASH_DIRNAME}"
         self._runtime_name = runtime_name
         self._run_command = run_command
         self._run_status = run_status
         self._dataset_resolver = dataset_resolver
         self._rootfs_resolver = rootfs_resolver
         self._zfs_bin = zfs_bin
+        self._async_destroy = bool(async_destroy)
+        self._trash_init_lock = threading.Lock()
+        self._trash_ready = False
+        self._reaper_cond = threading.Condition(threading.Lock())
+        self._reaper_queue: deque[tuple[SandboxId | None, str]] = deque()
+        self._reaper_queued_names: set[str] = set()
+        self._reaper_active_dataset: str | None = None
+        self._reaper_sweeping = False
+        self._reaper_sweep_needed = True
+        self._reaper_closed = False
+        self._reaper_thread: threading.Thread | None = None
 
     @property
     def name(self) -> str:
         return "zfs"
+
+    @property
+    def async_destroy(self) -> bool:
+        return self._async_destroy
+
+    @property
+    def trash_prefix(self) -> str:
+        return self._trash_prefix
 
     # ------------------------------------------------------------------
     # Naming / layout
@@ -351,6 +378,10 @@ class ZfsProvider(FilesystemProvider):
                 command=(self._zfs_bin, "rollback", "-r", snapshot),
                 metadata={**metadata, "origin": origin},
             )
+        if self._async_destroy and self.has_pending_destroys():
+            # Ensure any just-killed fork clones detached to .trash finish
+            # reaping before `zfs rollback -r` destroys newer snapshots.
+            self.wait_for_pending_destroys(timeout=5.0)
         return self._run_status(
             [self._zfs_bin, "rollback", "-r", snapshot],
             operation="sandbox.restore_filesystem",
@@ -391,6 +422,19 @@ class ZfsProvider(FilesystemProvider):
             check=False,
             metadata={"snapshot": snapshot, "fs_ref": fs_ref},
         )
+        if (
+            result.returncode != 0
+            and self._async_destroy
+            and "dependent clones" in result.stderr
+            and (self._trash_prefix in result.stderr or self.has_pending_destroys())
+        ):
+            self.wait_for_pending_destroys(timeout=5.0)
+            result = self._run_command(
+                [self._zfs_bin, "destroy", snapshot],
+                operation="storage.zfs_destroy_snapshot_ref",
+                check=False,
+                metadata={"snapshot": snapshot, "fs_ref": fs_ref, "retry_after_trash_drain": True},
+            )
         if result.returncode != 0:
             stderr = result.stderr.strip()
             if "dataset does not exist" in stderr or "snapshot does not exist" in stderr:
@@ -403,6 +447,91 @@ class ZfsProvider(FilesystemProvider):
             )
 
     def destroy_filesystem_dataset(self, sandbox_id: SandboxId, dataset: str) -> None:
+        if not self._async_destroy or self._is_reaper_closed() or self._is_trash_dataset(dataset):
+            self._destroy_dataset_sync(sandbox_id, dataset)
+            return
+
+        # Fast-path check: confirm the dataset exists and has no live external
+        # clone dependencies (`zfs rename` would succeed even with a live
+        # dependent clone, hiding an error that `zfs destroy -r` surfaces).
+        clones_result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-o", "clones", "-t", "snapshot", "-r", dataset],
+            operation="sandbox.zfs_check_clones",
+            sandbox_id=sandbox_id,
+            check=False,
+            metadata={"dataset": dataset},
+        )
+        if clones_result.returncode != 0:
+            stderr = clones_result.stderr.strip()
+            if "does not exist" in stderr:
+                return
+            self._destroy_dataset_sync(sandbox_id, dataset)
+            return
+
+        if self._has_live_external_clones(dataset, clones_result.stdout):
+            self._destroy_dataset_sync(sandbox_id, dataset)
+            return
+
+        unmount_state = self._unmount_for_detach(sandbox_id, dataset)
+        if unmount_state == "missing":
+            return
+        if unmount_state != "unmounted":
+            self._destroy_dataset_sync(sandbox_id, dataset)
+            return
+
+        if not self._ensure_trash_dataset():
+            self._destroy_dataset_sync(sandbox_id, dataset)
+            return
+
+        trash_target = self._next_trash_target(dataset, sandbox_id)
+        rename_result = self._run_command(
+            [self._zfs_bin, "rename", "-u", dataset, trash_target],
+            operation="sandbox.zfs_rename_trash",
+            sandbox_id=sandbox_id,
+            check=False,
+            metadata={"dataset": dataset, "trash_dataset": trash_target},
+        )
+        if rename_result.returncode != 0:
+            stderr = rename_result.stderr.strip()
+            if "parent does not exist" in stderr or (
+                "does not exist" in stderr and self._trash_prefix in stderr
+            ):
+                with self._trash_init_lock:
+                    self._trash_ready = False
+                if self._ensure_trash_dataset():
+                    rename_result = self._run_command(
+                        [self._zfs_bin, "rename", "-u", dataset, trash_target],
+                        operation="sandbox.zfs_rename_trash",
+                        sandbox_id=sandbox_id,
+                        check=False,
+                        metadata={
+                            "dataset": dataset,
+                            "trash_dataset": trash_target,
+                            "retry_ensure_trash": True,
+                        },
+                    )
+            elif "does not exist" in stderr:
+                return
+
+        if rename_result.returncode == 0:
+            if not self._enqueue_trash_destroy(sandbox_id, trash_target):
+                self._destroy_dataset_sync(sandbox_id, trash_target)
+            return
+
+        stderr = rename_result.stderr.strip()
+        if "does not exist" in stderr and "parent does not exist" not in stderr:
+            return
+        logger.debug(
+            "ZFS fast detach rename failed; falling back to synchronous destroy "
+            "sandbox=%s dataset=%s rc=%d stderr=%s",
+            sandbox_id,
+            dataset,
+            rename_result.returncode,
+            stderr,
+        )
+        self._destroy_dataset_sync(sandbox_id, dataset)
+
+    def _destroy_dataset_sync(self, sandbox_id: SandboxId | None, dataset: str) -> None:
         result: CommandResult | None = None
         stderr = ""
         for attempt in range(1, _DATASET_DESTROY_BUSY_RETRIES + 1):
@@ -435,6 +564,263 @@ class ZfsProvider(FilesystemProvider):
                 f"\nstdout: {result.stdout.strip()}"
                 f"\nstderr: {stderr}"
             )
+
+    # ------------------------------------------------------------------
+    # Fast detach + asynchronous trash reaper
+    # ------------------------------------------------------------------
+
+    def _is_trash_dataset(self, dataset: str) -> bool:
+        return dataset == self._trash_prefix or dataset.startswith(f"{self._trash_prefix}/")
+
+    def _is_reaper_closed(self) -> bool:
+        with self._reaper_cond:
+            return self._reaper_closed
+
+    def _has_live_external_clones(self, dataset: str, stdout: str) -> bool:
+        trash_child_prefix = f"{self._trash_prefix}/"
+        dataset_child_prefix = f"{dataset}/"
+        for raw_line in stdout.splitlines():
+            for part in raw_line.split(","):
+                clone = part.strip()
+                if not clone or clone == "-":
+                    continue
+                if clone == dataset or clone.startswith(dataset_child_prefix):
+                    continue
+                if clone.startswith(trash_child_prefix):
+                    continue
+                return True
+        return False
+
+    def _unmount_for_detach(self, sandbox_id: SandboxId, dataset: str) -> str:
+        for attempt in range(1, _DETACH_UNMOUNT_RETRIES + 1):
+            result = self._run_command(
+                [self._zfs_bin, "unmount", "-f", dataset],
+                operation="sandbox.zfs_unmount",
+                sandbox_id=sandbox_id,
+                check=False,
+                metadata={"dataset": dataset, "attempt": attempt},
+            )
+            if result.returncode == 0:
+                return "unmounted"
+            stderr = result.stderr.strip()
+            if (
+                "not currently mounted" in stderr
+                or "no mountpoint" in stderr
+                or "not a mountpoint" in stderr
+            ):
+                return "unmounted"
+            if "does not exist" in stderr:
+                return "missing"
+            if "busy" not in stderr:
+                return "failed"
+            if attempt < _DETACH_UNMOUNT_RETRIES:
+                time.sleep(_DETACH_UNMOUNT_RETRY_DELAY_S)
+        return "failed"
+
+    def _ensure_trash_dataset(self) -> bool:
+        with self._trash_init_lock:
+            if self._trash_ready:
+                return True
+            result = self._run_command(
+                [self._zfs_bin, "create", "-p", "-o", "mountpoint=none", self._trash_prefix],
+                operation="sandbox.zfs_ensure_trash",
+                check=False,
+                metadata={"trash_prefix": self._trash_prefix},
+            )
+            stderr = result.stderr.strip()
+            if (
+                result.returncode == 0
+                or "dataset already exists" in stderr
+                or "filesystem already exists" in stderr
+            ):
+                self._trash_ready = True
+                return True
+            return False
+
+    def _next_trash_target(self, dataset: str, sandbox_id: SandboxId) -> str:
+        raw_leaf = dataset.rsplit("/", 1)[-1] or str(sandbox_id)
+        safe_leaf = "".join(
+            ch if ch.isalnum() or ch in {"-", "_", ".", ":"} else "_"
+            for ch in raw_leaf
+        )
+        token = f"{time.monotonic_ns():x}-{uuid.uuid4().hex[:8]}"
+        return f"{self._trash_prefix}/{safe_leaf}-{token}"
+
+    def _ensure_reaper_thread_locked(self) -> None:
+        if self._reaper_thread is not None and self._reaper_thread.is_alive():
+            return
+        self._reaper_thread = threading.Thread(
+            target=self._reaper_loop,
+            name=f"crab-zfs-reaper-{self._safe_prefix()}",
+            daemon=True,
+        )
+        self._reaper_thread.start()
+
+    def _enqueue_trash_destroy(self, sandbox_id: SandboxId | None, trash_dataset: str) -> bool:
+        with self._reaper_cond:
+            if self._reaper_closed:
+                return False
+            if trash_dataset not in self._reaper_queued_names:
+                self._reaper_queue.append((sandbox_id, trash_dataset))
+                self._reaper_queued_names.add(trash_dataset)
+            self._ensure_reaper_thread_locked()
+            self._reaper_cond.notify_all()
+            return True
+
+    def sweep_trash_async(self) -> None:
+        if not self._async_destroy:
+            return
+        with self._reaper_cond:
+            if self._reaper_closed:
+                return
+            self._reaper_sweep_needed = True
+            self._ensure_reaper_thread_locked()
+            self._reaper_cond.notify_all()
+
+    def has_pending_destroys(self) -> bool:
+        if not self._async_destroy:
+            return False
+        with self._reaper_cond:
+            return bool(
+                self._reaper_sweeping
+                or self._reaper_queue
+                or self._reaper_active_dataset is not None
+            )
+
+    def _is_reaper_idle_locked(self) -> bool:
+        if self._reaper_thread is None:
+            return not self._reaper_queue
+        return (
+            not self._reaper_sweep_needed
+            and not self._reaper_sweeping
+            and not self._reaper_queue
+            and self._reaper_active_dataset is None
+        )
+
+    def wait_for_pending_destroys(self, timeout: float = 30.0) -> bool:
+        if not self._async_destroy:
+            return True
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        with self._reaper_cond:
+            while not self._is_reaper_idle_locked():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._reaper_cond.wait(timeout=remaining)
+            return True
+
+    def close(self, timeout: float = 30.0) -> bool:
+        if not self._async_destroy:
+            return True
+        deadline = time.monotonic() + max(float(timeout), 0.0)
+        with self._reaper_cond:
+            self._reaper_closed = True
+            if self._reaper_thread is None and not self._reaper_queue:
+                self._reaper_sweep_needed = False
+                return True
+            self._reaper_cond.notify_all()
+            thread = self._reaper_thread
+        drained = self.wait_for_pending_destroys(timeout=max(0.0, deadline - time.monotonic()))
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        return drained and (thread is None or not thread.is_alive())
+
+    def _discover_leftover_trash(self) -> list[str]:
+        result = self._run_command(
+            [self._zfs_bin, "list", "-H", "-d", "1", "-o", "name,origin", self._trash_prefix],
+            operation="sandbox.zfs_sweep_trash",
+            check=False,
+            metadata={"trash_prefix": self._trash_prefix},
+        )
+        if result.returncode != 0:
+            return []
+        origins: dict[str, str | None] = {}
+        child_prefix = f"{self._trash_prefix}/"
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t")
+            name = parts[0].strip()
+            if not name.startswith(child_prefix):
+                continue
+            raw_origin = parts[1].strip() if len(parts) > 1 else "-"
+            origin_ds = (
+                raw_origin.split("@", 1)[0]
+                if raw_origin and raw_origin != "-" and "@" in raw_origin
+                else None
+            )
+            origins[name] = origin_ds
+        ordered: list[str] = []
+        remaining = dict(origins)
+        while remaining:
+            referenced_origins = {
+                orig for orig in remaining.values() if orig in remaining
+            }
+            ready = sorted(ds for ds in remaining if ds not in referenced_origins)
+            if not ready:
+                ready = sorted(remaining)
+            for ds in ready:
+                ordered.append(ds)
+                remaining.pop(ds, None)
+        return ordered
+
+    def _reaper_loop(self) -> None:
+        while True:
+            do_sweep = False
+            item: tuple[SandboxId | None, str] | None = None
+            with self._reaper_cond:
+                while (
+                    not self._reaper_sweep_needed
+                    and not self._reaper_queue
+                    and not self._reaper_closed
+                ):
+                    self._reaper_cond.wait()
+                if self._reaper_sweep_needed:
+                    self._reaper_sweep_needed = False
+                    self._reaper_sweeping = True
+                    do_sweep = True
+                elif self._reaper_queue:
+                    item = self._reaper_queue.popleft()
+                    self._reaper_active_dataset = item[1]
+                elif self._reaper_closed:
+                    self._reaper_cond.notify_all()
+                    return
+
+            if do_sweep:
+                try:
+                    leftovers = self._discover_leftover_trash()
+                except Exception:
+                    logger.warning(
+                        "ZFS trash startup sweep failed prefix=%s",
+                        self._trash_prefix,
+                        exc_info=True,
+                    )
+                    leftovers = []
+                with self._reaper_cond:
+                    for ds in leftovers:
+                        if ds not in self._reaper_queued_names:
+                            self._reaper_queue.append((None, ds))
+                            self._reaper_queued_names.add(ds)
+                    self._reaper_sweeping = False
+                    self._reaper_cond.notify_all()
+                continue
+
+            assert item is not None
+            sandbox_id, trash_dataset = item
+            try:
+                self._destroy_dataset_sync(sandbox_id, trash_dataset)
+            except Exception:
+                logger.warning(
+                    "Background ZFS trash destroy failed sandbox=%s dataset=%s",
+                    sandbox_id,
+                    trash_dataset,
+                    exc_info=True,
+                )
+            finally:
+                with self._reaper_cond:
+                    self._reaper_queued_names.discard(trash_dataset)
+                    self._reaper_active_dataset = None
+                    self._reaper_cond.notify_all()
 
     def promote_filesystem_dataset(self, sandbox_id: SandboxId) -> None:
         dataset = self._dataset_resolver(sandbox_id)

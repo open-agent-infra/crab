@@ -322,6 +322,11 @@ def _runc_options_from_mapping(data: Mapping[str, Any]) -> RuncRuntimeOptions:
             data.get("btrfs_qgroups_enabled"),
             default=base.btrfs_qgroups_enabled,
         ),
+        zfs_async_destroy=(
+            None
+            if data.get("zfs_async_destroy") is None
+            else _as_bool(data.get("zfs_async_destroy"), default=True)
+        ),
     )
 
 
@@ -1481,6 +1486,8 @@ class Engine:
             telemetry=telemetry,
             host_inspector_client=self._host_inspector_client,
         )
+        if backend == "zfs":
+            runtime.start_background_maintenance()
         storage_cfg = cfg.storage_config or StorageConfig(root_dir=storage_root)
         journal = None
         if cfg.enable_action_journal:
@@ -1774,6 +1781,13 @@ class Engine:
                 except Exception:
                     logger.exception("Sandbox network cleanup failed")
                 self._network_manager = None
+            if self._runtime is not None:
+                close_runtime = getattr(self._runtime, "close", None)
+                if callable(close_runtime):
+                    try:
+                        close_runtime(timeout=30.0)
+                    except Exception:
+                        logger.debug("Runtime background drain failed", exc_info=True)
             if self._system is not None:
                 try:
                     self._system.stop()

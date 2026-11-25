@@ -728,10 +728,9 @@ class _Routes:
             eng.system.release_fork(sid)
         except Exception:
             logger.exception("fork release bookkeeping failed for %s during kill", sid)
-        try:
-            eng.runtime.stop(sid)
-        except Exception:
-            logger.debug("runtime.stop failed for %s during kill", sid, exc_info=True)
+        # Skip graceful runtime.stop() (2s SIGTERM poll) on destructive kill:
+        # runtime.delete() unconditionally executes `runc delete --force`,
+        # matching Sandbox.kill() and Engine._destroy_txn_fork().
         try:
             eng.runtime.delete(sid)
         except Exception:
@@ -2179,10 +2178,6 @@ class DaemonServer:
         engine = self._engine
         if engine is not None:
             for sandbox_id in self.sandbox_ids():
-                try:
-                    engine.runtime.stop(sandbox_id)
-                except Exception:
-                    pass
                 try:
                     engine.runtime.delete(sandbox_id)
                 except Exception:

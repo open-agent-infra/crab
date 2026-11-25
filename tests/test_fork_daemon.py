@@ -233,10 +233,10 @@ class ForkRouteHandlerTests(unittest.TestCase):
                 ("release_txn", "src"),
                 ("prepare_source_destroy", "src"),
                 ("release_fork", "src"),
-                ("stop", "src"),
+                ("delete", "src"),
             ],
         )
-        self.assertIn(("delete", "src"), self.engine.log)
+        self.assertNotIn(("stop", "src"), self.engine.log)
         self.assertLess(
             self.engine.log.index(("release_fork", "src")),
             self.engine.log.index(("delete", "src")),

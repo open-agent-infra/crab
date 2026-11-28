@@ -1488,8 +1488,12 @@ class GatewayServer:
             self.reconcile()
             self._rehydrate_ports()
             handler = _build_handler(self)
-            self._http_server = ThreadingHTTPServer((self._host, self._port), handler)
-            self._http_server.daemon_threads = True
+
+            class _HighBacklogHTTPServer(ThreadingHTTPServer):
+                request_queue_size = 1024
+                daemon_threads = True
+
+            self._http_server = _HighBacklogHTTPServer((self._host, self._port), handler)
             self._port = int(self._http_server.server_address[1])
             admin_handler = _build_admin_handler(self)
             self._admin_server = serve_unix_socket(self._admin_socket_path, admin_handler)

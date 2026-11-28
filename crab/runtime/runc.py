@@ -1610,10 +1610,8 @@ class RuncRuntime(Runtime):
                     scope.cgroup_path,
                     exc_info=True,
                 )
-        try:
-            scope.pid_file.parent.rmdir()
-        except OSError:
-            pass
+        # Keep `.crab-exec/` for the lifetime of the bundle so concurrent `runc exec`
+        # `--pid-file` opens never race `rmdir()`.
 
     def _abort_exec_process(
         self,
@@ -1749,6 +1747,8 @@ class RuncRuntime(Runtime):
                 stdout=stdout_target,
                 stderr=stderr_target,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
             )
         except Exception:
             self._remove_exec_scope_artifacts(scope)

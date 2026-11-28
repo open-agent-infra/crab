@@ -773,6 +773,18 @@ class CrabSystem:
                 target_sandbox_id,
                 target_rootfs_path=target_rootfs_path,
             )
+            etc_hosts = target_rootfs_path / "etc" / "hosts"
+            if etc_hosts.parent.is_dir() and not etc_hosts.is_symlink():
+                try:
+                    existing_hosts = etc_hosts.read_text(encoding="utf-8", errors="replace") if etc_hosts.is_file() else ""
+                    if str(target_sandbox_id) not in existing_hosts:
+                        etc_hosts.write_text(
+                            f"127.0.0.1\tlocalhost {target_sandbox_id}\n"
+                            "::1\tlocalhost ip6-localhost ip6-loopback\n",
+                            encoding="utf-8",
+                        )
+                except OSError:
+                    pass
             inherited_launch_metadata: dict[str, object] = {}
             try:
                 source_description = self.runtime.describe(source_sandbox_id)

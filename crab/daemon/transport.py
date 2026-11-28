@@ -87,6 +87,7 @@ class _UnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
 
     allow_reuse_address = True
     daemon_threads = True
+    request_queue_size = 1024
 
     def __init__(
         self,

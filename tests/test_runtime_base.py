@@ -49,6 +49,8 @@ class RuntimeBaseTests(unittest.TestCase):
         self.assertIsNone(kwargs["stdin"])
         self.assertIs(kwargs["stdout"], subprocess.PIPE)
         self.assertIs(kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(kwargs["encoding"], "utf-8")
+        self.assertEqual(kwargs["errors"], "replace")
 
     def test_run_accepts_timeout_override(self) -> None:
         runner = SubprocessCommandRunner(timeout_seconds=1.0)

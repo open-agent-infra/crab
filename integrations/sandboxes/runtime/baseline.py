@@ -157,6 +157,36 @@ def materialize_resolver_config(
     )
 
 
+def materialize_hosts_config(
+    bundle_dir: Path,
+    *,
+    hostname: str | None = None,
+) -> Path:
+    """Write a standard `/etc/hosts` file beside an OCI bundle mapping `localhost` and the
+    container `hostname` to loopback (`127.0.0.1` / `::1`), matching Docker's default `/etc/hosts`
+    so tools like `git` (`getaddrinfo(gethostname())`) never block on unreachable upstream DNS.
+    """
+    resolved_hostname = (hostname or "").strip()
+    if not resolved_hostname:
+        try:
+            payload = json.loads((Path(bundle_dir) / "config.json").read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and isinstance(payload.get("hostname"), str):
+                resolved_hostname = payload["hostname"].strip()
+        except (OSError, json.JSONDecodeError):
+            resolved_hostname = ""
+    host_tokens = ["localhost"]
+    if resolved_hostname and resolved_hostname not in host_tokens:
+        host_tokens.append(resolved_hostname)
+    rendered = (
+        f"127.0.0.1\t{' '.join(host_tokens)}\n"
+        "::1\tlocalhost ip6-localhost ip6-loopback\n"
+    )
+    destination = Path(bundle_dir) / "crab-hosts"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(destination, rendered, mode=0o644)
+    return destination
+
+
 def add_dns_materialization(
     runtime_metadata: dict[str, object],
     *,
@@ -164,7 +194,7 @@ def add_dns_materialization(
     candidates: Iterable[Path] | None = None,
     isolated: bool | None = None,
 ) -> Path:
-    """Add the shared post-clone DNS directive to launch metadata."""
+    """Add the shared post-clone DNS and `/etc/hosts` directives to launch metadata."""
 
     if isolated is None:
         isolated = _bundle_uses_network_namespace(bundle_dir)
@@ -182,14 +212,22 @@ def add_dns_materialization(
         candidates=selected_candidates,
         allow_loopback=not isolated,
     )
+    hosts_path = materialize_hosts_config(bundle_dir)
     copy_paths = list(runtime_metadata.get("rootfs_post_clone_copy_paths", []))
-    item = {
-        "source": str(resolver_path),
-        "destination": "/etc/resolv.conf",
-        "replace": True,
-    }
-    if item not in copy_paths:
-        copy_paths.append(item)
+    for item in (
+        {
+            "source": str(resolver_path),
+            "destination": "/etc/resolv.conf",
+            "replace": True,
+        },
+        {
+            "source": str(hosts_path),
+            "destination": "/etc/hosts",
+            "replace": True,
+        },
+    ):
+        if item not in copy_paths:
+            copy_paths.append(item)
     runtime_metadata["rootfs_post_clone_copy_paths"] = copy_paths
     runtime_metadata["rootfs_preparation_schema"] = SANDBOX_ROOTFS_PREPARATION_SCHEMA
     return resolver_path
@@ -276,6 +314,7 @@ __all__ = [
     "add_dns_materialization",
     "apply_sandbox_bundle_baseline",
     "apply_sandbox_process_baseline",
+    "materialize_hosts_config",
     "materialize_resolver_config",
     "version_shared_rootfs_key",
 ]

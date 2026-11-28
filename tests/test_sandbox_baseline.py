@@ -78,6 +78,11 @@ class SandboxBaselineTests(unittest.TestCase):
             root = Path(temp_dir)
             resolver = root / "resolver.conf"
             resolver.write_text("nameserver 192.0.2.53\n", encoding="utf-8")
+            bundle_dir = root / "bundle"
+            bundle_dir.mkdir(parents=True, exist_ok=True)
+            (bundle_dir / "config.json").write_text(
+                json.dumps({"hostname": "crab-test-host"}), encoding="utf-8"
+            )
             metadata: dict[str, object] = {
                 "rootfs_copy_paths": [
                     {"source": "/immutable/image", "destination": "/"}
@@ -86,7 +91,7 @@ class SandboxBaselineTests(unittest.TestCase):
 
             generated = add_dns_materialization(
                 metadata,
-                bundle_dir=root / "bundle",
+                bundle_dir=bundle_dir,
                 candidates=(resolver,),
             )
 
@@ -101,9 +106,16 @@ class SandboxBaselineTests(unittest.TestCase):
                         "source": str(generated),
                         "destination": "/etc/resolv.conf",
                         "replace": True,
-                    }
+                    },
+                    {
+                        "source": str(bundle_dir / "crab-hosts"),
+                        "destination": "/etc/hosts",
+                        "replace": True,
+                    },
                 ],
             )
+            hosts_text = (bundle_dir / "crab-hosts").read_text(encoding="utf-8")
+            self.assertIn("127.0.0.1\tlocalhost crab-test-host\n", hosts_text)
             self.assertEqual(
                 metadata["rootfs_preparation_schema"],
                 SANDBOX_ROOTFS_PREPARATION_SCHEMA,

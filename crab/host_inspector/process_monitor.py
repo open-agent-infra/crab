@@ -27,7 +27,13 @@ def clear_soft_dirty(pid: int) -> None:
     Path(f"/proc/{pid}/clear_refs").write_text("4\n", encoding="utf-8")
 
 
-def reset_soft_dirty_for_pids(pids: set[int]) -> set[int]:
+def reset_soft_dirty_for_pids(
+    pids: set[int],
+    *,
+    stabilize: bool = False,
+    stabilize_attempts: int = 3,
+    stabilize_delay: float = 0.05,
+) -> set[int]:
     cleared: set[int] = set()
     for pid in sorted(pids):
         try:
@@ -35,7 +41,40 @@ def reset_soft_dirty_for_pids(pids: set[int]) -> set[int]:
             cleared.add(pid)
         except FileNotFoundError:
             continue
+    if stabilize and cleared:
+        _stabilize_soft_dirty(cleared, attempts=stabilize_attempts, delay=stabilize_delay)
     return cleared
+
+
+def _stabilize_soft_dirty(pids: set[int], *, attempts: int, delay: float) -> None:
+    """Re-clear soft-dirty until the writable set reads clean or attempts run out.
+
+    A checkpoint dumps the tasks with CRIU --leave-running while the container
+    is paused; the parasite teardown on the subsequent *resume* dirties 1-3
+    residual pages -- and it does so just after the baseline clear. Those pages
+    are a one-time artifact of the checkpoint, not workload activity, so a
+    follow-up clear settles them permanently.
+
+    We sleep BEFORE each scan so a residual page that lands slightly after the
+    baseline clear is still observed: a scan-first loop could read clean before
+    the resume writes arrive and stop too early, leaving the residue latched.
+
+    A genuinely busy process re-dirties pages continuously: it still reads dirty
+    after every re-clear and simply exhausts `attempts`, after which we leave it
+    alone. The next status() poll re-scans and reports it dirty, so real memory
+    writes are never masked -- this loop only removes checkpoint residue.
+    """
+    for _ in range(attempts):
+        if delay > 0:
+            time.sleep(delay)
+        still = dirty_pids(pids)
+        if not still:
+            return
+        for pid in sorted(still):
+            try:
+                clear_soft_dirty(pid)
+            except FileNotFoundError:
+                pids.discard(pid)
 
 
 def parse_writable_ranges(pid: int) -> list[tuple[int, int]]:

@@ -376,6 +376,47 @@ class HostInspectorDaemon:
         )
         return response
 
+    def mark_filesystem_changed(
+        self,
+        sandbox_id: str,
+        *,
+        reason: str,
+    ) -> dict[str, object]:
+        """Latch a conservative dirty marker until the next reset.
+
+        The kernel monitor keys filesystem events by the task's current
+        cgroup ID.  A timeout-isolated exec runs in a child cgroup, so its
+        events cannot be matched to the sandbox's registered parent cgroup.
+        Recording one synthetic unresolved event avoids a false-clean result;
+        the authoritative backend diff still determines the actual changes.
+        """
+
+        when = utc_now()
+        marker = {
+            "kind": "conservative_invalidation",
+            "counts_as_change": True,
+            "reason": str(reason),
+            "timestamp": when.isoformat(),
+        }
+        sandbox_lock = self._sandbox_lock(sandbox_id)
+        with sandbox_lock:
+            with self._records_lock:
+                existing = self._records.get(sandbox_id)
+                if existing is None:
+                    raise KeyError(sandbox_id)
+            unresolved = [*existing.unreconciled_fs_events, marker]
+            if len(unresolved) > _RECENT_EVENT_LIMIT:
+                unresolved = unresolved[-_RECENT_EVENT_LIMIT:]
+            updated = replace(
+                existing,
+                filesystem_changed=True,
+                observed_at=max(existing.observed_at or when, when),
+                unreconciled_fs_events=unresolved,
+            )
+            with self._records_lock:
+                self._records[sandbox_id] = updated
+            return self._record_to_response(updated)
+
     def status(self, sandbox_id: str) -> dict[str, object]:
         # Drain in-flight BPF events before reading state. Under load the
         # kernel→helper→daemon pipeline lags by several seconds, so without
@@ -596,7 +637,14 @@ class HostInspectorDaemon:
             all_current_pids = list_cgroup_pids(resolved.cgroup_path)
             tracked_pids, ignored_pids, fs_ignored_pids = self._split_pids(all_current_pids, existing.ignore_process_rules)
             soft_dirty_start = time.monotonic()
-            baseline_pids = reset_soft_dirty_for_pids(tracked_pids)
+            # When this reset follows a full process checkpoint, CRIU dumped
+            # the tasks with --leave-running; its parasite/resume writes can
+            # leave a few residual soft-dirty pages that land around this
+            # clear. Stabilize (re-clear until clean or attempts exhausted) so
+            # an otherwise idle checkpointed sandbox does not latch a false
+            # process_changed=True. Genuinely busy processes keep re-dirtying
+            # and are still reported by the next status() poll.
+            baseline_pids = reset_soft_dirty_for_pids(tracked_pids, stabilize=captures_process)
             soft_dirty_ms = (time.monotonic() - soft_dirty_start) * 1000.0
 
             # When this reset follows a full process checkpoint, snapshot
@@ -1438,6 +1486,16 @@ class HostInspectorServer:
                         )
                         logger.debug(f"host-inspector: reset {payload=} {result=}")
                         self._write_json(HTTPStatus.OK, {"ok": True, "status": result})
+                        return
+                    if self.path == "/mark_filesystem_changed":
+                        payload = self._read_json()
+                        result = daemon.mark_filesystem_changed(
+                            str(payload["sandbox_id"]),
+                            reason=str(payload.get("reason") or "external"),
+                        )
+                        self._write_json(
+                            HTTPStatus.OK, {"ok": True, "status": result}
+                        )
                         return
                     if self.path == "/unregister":
                         payload = self._read_json()

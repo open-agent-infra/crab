@@ -42,7 +42,14 @@ from crab import (
     SpotPreemptionCheckpointingPolicy,
     StorageConfig,
 )
-from crab.models import CheckpointManifest, JobStatus, RecoveryEvent, RecoveryRecord, utc_now
+from crab.models import (
+    CheckpointManifest,
+    JobStatus,
+    RecoveryEvent,
+    RecoveryRecord,
+    SchedulerCheckpointDecision,
+    utc_now,
+)
 from integrations.llm_services.simulated.service import SimulatedLLMState, handle_request
 from crab.runtime import CommandRunner
 
@@ -134,6 +141,54 @@ class MinimalExecutor:
 
 
 class SystemIntegrationTests(unittest.TestCase):
+    def test_incremental_decision_with_missing_parent_manifest_becomes_anchor(self) -> None:
+        class MissingStorage:
+            def get_manifest(self, sandbox_id, checkpoint_id):
+                _ = (sandbox_id, checkpoint_id)
+                raise FileNotFoundError(checkpoint_id)
+
+        system = CrabSystem.__new__(CrabSystem)
+        system.storage = MissingStorage()
+        system.runtime = object()
+        parent_id = CheckpointId("ckpt-missing-parent")
+        decision = SchedulerCheckpointDecision(
+            should_checkpoint=True,
+            checkpoint_process=True,
+            checkpoint_filesystem=True,
+            leave_running=True,
+            reason="process_changed",
+            policy_name="test",
+            is_incremental_process=True,
+            parent_process_checkpoint_id=parent_id,
+            produce_pre_dump=True,
+            metadata={
+                "incremental_process": True,
+                "incremental_chain_role": "node",
+                "process_chain_length_after": 3,
+            },
+        )
+
+        resolved = CrabSystem._ensure_incremental_parent_available(
+            system,
+            SandboxId("sbx-missing-parent"),
+            decision,
+        )
+
+        self.assertFalse(resolved.is_incremental_process)
+        self.assertIsNone(resolved.parent_process_checkpoint_id)
+        self.assertTrue(resolved.produce_pre_dump)
+        self.assertEqual(resolved.metadata["incremental_chain_role"], "anchor")
+        self.assertEqual(resolved.metadata["process_chain_length_after"], 0)
+        self.assertEqual(
+            resolved.metadata["incremental_parent_reset_reason"],
+            "missing_parent_manifest",
+        )
+        self.assertEqual(
+            resolved.metadata["incremental_parent_candidate"],
+            str(parent_id),
+        )
+        self.assertNotIn("incremental_process", resolved.metadata)
+
     def test_build_checkpoint_metadata_captures_spec_pair_group_once(self) -> None:
         request_store = InMemoryRequestStateStore()
         response_gate_registry = SandboxResponseGateRegistry()
@@ -254,6 +309,7 @@ class SystemIntegrationTests(unittest.TestCase):
         relaunch_handler=None,
         enforce_restore_checkpoint_validation: bool = False,
         relaunch_on_restore_failure: bool = False,
+        scheduler_config: SchedulerConfig | None = None,
     ) -> tuple[CrabSystem, CRExecutor]:
         runtime = RuncRuntimeAdapter(
             command_runner=runner,
@@ -285,11 +341,12 @@ class SystemIntegrationTests(unittest.TestCase):
             paths=RuncSandboxManagerPaths(
                 state_root=root / "runtime-state",
                 bundle_root=root / "bundles",
+                checkpoint_root=root / "checkpoints",
                 metadata_root=root / "sandbox-metadata",
                 zfs_dataset_prefix="pool/crab",
             ),
         )
-        scheduler_cfg = SchedulerConfig(
+        scheduler_cfg = scheduler_config or SchedulerConfig(
             min_checkpoint_interval_seconds=0.0,
             force_checkpoint_after_seconds=0.0,
             require_change_signal=True,
@@ -315,6 +372,340 @@ class SystemIntegrationTests(unittest.TestCase):
             relaunch_on_restore_failure=relaunch_on_restore_failure,
         )
         return system, executor
+
+    def test_requested_logical_checkpoints_reuse_or_partially_materialize(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_logical_ckpt_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            inspector = EBPFSandboxInspector(InMemoryEBPFEventCollector())
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-logical",
+                    "bundle_path": str(root / "bundles" / "sbx-logical"),
+                },
+            )
+
+            try:
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=False,
+                        observed_at=utc_now(),
+                    )
+                )
+                baseline = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-1",
+                )
+                self.assertEqual(baseline.status, JobStatus.SUCCEEDED)
+                assert baseline.manifest is not None
+                self.assertTrue(baseline.manifest.process_artifacts)
+                self.assertTrue(baseline.manifest.filesystem_artifacts)
+                self.assertEqual(
+                    baseline.manifest.metadata["checkpoint_materialization"],
+                    "full",
+                )
+
+                physical_commands_before_reuse = [
+                    command
+                    for command in runner.commands
+                    if (command and command[0] == "runc" and "checkpoint" in command)
+                    or command[:2] == ("zfs", "snapshot")
+                ]
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=False,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=baseline.finished_at,
+                    )
+                )
+                reused = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-2",
+                )
+                self.assertEqual(reused.status, JobStatus.SUCCEEDED)
+                assert reused.manifest is not None
+                self.assertEqual(reused.checkpoint_id, CheckpointId("ckpt-logical-2"))
+                self.assertEqual(reused.manifest.process_artifacts, [])
+                self.assertEqual(reused.manifest.filesystem_artifacts, [])
+                self.assertEqual(
+                    reused.manifest.metadata["checkpoint_materialization"],
+                    "reused",
+                )
+                self.assertEqual(
+                    reused.manifest.metadata["process_restore_checkpoint_id"],
+                    "ckpt-logical-1",
+                )
+                self.assertEqual(
+                    reused.manifest.metadata["filesystem_restore_checkpoint_id"],
+                    "ckpt-logical-1",
+                )
+                physical_commands_after_reuse = [
+                    command
+                    for command in runner.commands
+                    if (command and command[0] == "runc" and "checkpoint" in command)
+                    or command[:2] == ("zfs", "snapshot")
+                ]
+                self.assertEqual(
+                    physical_commands_after_reuse,
+                    physical_commands_before_reuse,
+                )
+                resolved_reuse = system._resolve_restore_manifest(
+                    sandbox_id, reused.checkpoint_id
+                )
+                self.assertTrue(resolved_reuse.process_artifacts)
+                self.assertTrue(resolved_reuse.filesystem_artifacts)
+
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=True,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=baseline.finished_at,
+                    )
+                )
+                partial = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-3",
+                )
+                self.assertEqual(partial.status, JobStatus.SUCCEEDED)
+                assert partial.manifest is not None
+                self.assertEqual(partial.manifest.process_artifacts, [])
+                self.assertTrue(partial.manifest.filesystem_artifacts)
+                self.assertEqual(
+                    partial.manifest.metadata["checkpoint_materialization"],
+                    "filesystem_only",
+                )
+                self.assertEqual(
+                    partial.manifest.metadata["process_restore_checkpoint_id"],
+                    "ckpt-logical-1",
+                )
+                self.assertEqual(
+                    partial.manifest.metadata["filesystem_restore_checkpoint_id"],
+                    "ckpt-logical-3",
+                )
+
+                system.changeset_since(
+                    sandbox_id,
+                    reused.checkpoint_id,
+                    use_inspector_gate=False,
+                )
+                self.assertIn(
+                    (
+                        "zfs",
+                        "diff",
+                        "-FH",
+                        f"pool/crab/{sandbox_id}@ckpt-logical-1",
+                        f"pool/crab/{sandbox_id}",
+                    ),
+                    runner.commands,
+                )
+
+                # Restoring an older logical point must also move Crab's
+                # adaptive-reuse cursor backwards. The newer filesystem-only
+                # point remains stored, but a clean post-restore logical id
+                # must map to the state that is actually running (baseline),
+                # not to the newest manifest on disk (partial).
+                restored = system.restore_once(
+                    sandbox_id, baseline.checkpoint_id
+                )
+                self.assertEqual(restored.status, JobStatus.SUCCEEDED)
+                after_restore = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-logical-4",
+                )
+                self.assertEqual(after_restore.status, JobStatus.SUCCEEDED)
+                assert after_restore.manifest is not None
+                self.assertEqual(
+                    after_restore.manifest.metadata[
+                        "checkpoint_materialization"
+                    ],
+                    "reused",
+                )
+                self.assertEqual(
+                    after_restore.manifest.metadata[
+                        "process_restore_checkpoint_id"
+                    ],
+                    "ckpt-logical-1",
+                )
+                self.assertEqual(
+                    after_restore.manifest.metadata[
+                        "filesystem_restore_checkpoint_id"
+                    ],
+                    "ckpt-logical-1",
+                )
+            finally:
+                executor.shutdown()
+
+    def test_requested_incremental_chain_anchors_restores_and_recovers_from_standalone_full(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="crab_logical_incremental_") as tmp:
+            root = Path(tmp)
+            runner = FakeCommandRunner()
+            telemetry = InMemoryTelemetrySink()
+            inspector = EBPFSandboxInspector(InMemoryEBPFEventCollector())
+            scheduler_config = SchedulerConfig(
+                min_checkpoint_interval_seconds=0.0,
+                force_checkpoint_after_seconds=0.0,
+                require_change_signal=True,
+                incremental_process_enabled=True,
+                full_process_checkpoint_interval=8,
+                max_process_chain_length=16,
+            )
+            system, executor = self._build_runc_system(
+                root=root,
+                runner=runner,
+                telemetry=telemetry,
+                inspector=inspector,
+                scheduler_config=scheduler_config,
+            )
+            sandbox_id = system.sandbox_manager.launch(
+                "runc",
+                {
+                    "sandbox_id": "sbx-logical-incremental",
+                    "bundle_path": str(
+                        root / "bundles" / "sbx-logical-incremental"
+                    ),
+                },
+            )
+
+            try:
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=False,
+                        filesystem_changed=False,
+                        observed_at=utc_now(),
+                    )
+                )
+                baseline = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-incremental-anchor",
+                )
+                self.assertEqual(baseline.status, JobStatus.SUCCEEDED)
+                assert baseline.manifest is not None
+                self.assertEqual(baseline.manifest.process_kind, "full")
+                self.assertEqual(
+                    baseline.manifest.metadata["incremental_chain_role"],
+                    "anchor",
+                )
+                self.assertEqual(
+                    baseline.manifest.metadata["checkpoint_materialization"],
+                    "full",
+                )
+                anchor_pre_dump = system.runtime.pre_dump_location(
+                    sandbox_id, baseline.checkpoint_id
+                )
+                self.assertIsNotNone(anchor_pre_dump)
+                self.assertTrue(Path(str(anchor_pre_dump)).is_dir())
+
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=True,
+                        filesystem_changed=True,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=baseline.finished_at,
+                    )
+                )
+                incremental = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-incremental-node",
+                )
+                self.assertEqual(incremental.status, JobStatus.SUCCEEDED)
+                assert incremental.manifest is not None
+                self.assertEqual(incremental.manifest.process_kind, "incremental")
+                self.assertEqual(
+                    incremental.manifest.parent_checkpoint_id,
+                    baseline.checkpoint_id,
+                )
+                self.assertEqual(
+                    incremental.manifest.metadata["checkpoint_materialization"],
+                    "incremental",
+                )
+                self.assertEqual(
+                    system._stored_process_chain_length(
+                        sandbox_id, incremental.checkpoint_id
+                    ),
+                    1,
+                )
+
+                restored = system.restore_once(
+                    sandbox_id,
+                    incremental.checkpoint_id,
+                )
+                self.assertEqual(restored.status, JobStatus.SUCCEEDED)
+
+                standalone = system.checkpoint_once(
+                    sandbox_id,
+                    leave_running=True,
+                    checkpoint_id="ckpt-standalone-full",
+                )
+                self.assertEqual(standalone.status, JobStatus.SUCCEEDED)
+                standalone_pre_dump = system.runtime.pre_dump_location(
+                    sandbox_id, standalone.checkpoint_id
+                )
+                self.assertIsNotNone(standalone_pre_dump)
+                self.assertFalse(Path(str(standalone_pre_dump)).exists())
+
+                inspector.upsert_snapshot(
+                    SandboxSnapshot(
+                        sandbox_id=sandbox_id,
+                        runtime_name="runc",
+                        is_running=True,
+                        process_changed=True,
+                        filesystem_changed=True,
+                        observed_at=utc_now(),
+                        last_checkpoint_at=standalone.finished_at,
+                    )
+                )
+                reset_anchor = system.checkpoint_requested(
+                    sandbox_id,
+                    checkpoint_id="ckpt-reset-anchor",
+                )
+                self.assertEqual(reset_anchor.status, JobStatus.SUCCEEDED)
+                assert reset_anchor.manifest is not None
+                self.assertEqual(reset_anchor.manifest.process_kind, "full")
+                self.assertEqual(
+                    reset_anchor.manifest.metadata[
+                        "incremental_parent_reset_reason"
+                    ],
+                    "missing_pre_dump",
+                )
+                self.assertEqual(
+                    reset_anchor.manifest.metadata[
+                        "incremental_parent_candidate"
+                    ],
+                    str(standalone.checkpoint_id),
+                )
+                reset_pre_dump = system.runtime.pre_dump_location(
+                    sandbox_id, reset_anchor.checkpoint_id
+                )
+                self.assertIsNotNone(reset_pre_dump)
+                self.assertTrue(Path(str(reset_pre_dump)).is_dir())
+            finally:
+                executor.shutdown()
 
     def test_recovery_workers_match_restore_workers_and_run_different_sandboxes_in_parallel(self) -> None:
         class BlockingRecoverySystem(CrabSystem):
@@ -555,10 +946,31 @@ class SystemIntegrationTests(unittest.TestCase):
                     str(root / "runtime-state"),
                     "checkpoint",
                     "--image-path",
+                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "pre_dump"),
+                    "--work-path",
+                    str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "pre_dump_work"),
+                    "--pre-dump",
+                    "--tcp-established",
+                    "--shell-job",
+                    "--tcp-skip-in-flight",
+                    "--ext-unix-sk",
+                    "sbx-int",
+                ),
+                runner.commands,
+            )
+            self.assertIn(
+                (
+                    "runc",
+                    "--root",
+                    str(root / "runtime-state"),
+                    "checkpoint",
+                    "--image-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "process"),
                     "--work-path",
                     str(root / "checkpoints" / "sbx-int" / str(checkpoint_result.checkpoint_id) / "work"),
                     "--leave-running=false",
+                    "--parent-path",
+                    "../pre_dump",
                     "--tcp-established",
                     "--shell-job",
                     "--tcp-skip-in-flight",
@@ -600,7 +1012,7 @@ class SystemIntegrationTests(unittest.TestCase):
                 runner.commands,
             )
             self.assertEqual(
-                runner.commands[-3:],
+                runner.commands[-4:],
                 [
                     (
                         "runc",
@@ -610,6 +1022,7 @@ class SystemIntegrationTests(unittest.TestCase):
                         "sbx-int",
                         "TERM",
                     ),
+                    ("runc", "--root", str(root / "runtime-state"), "state", "sbx-int"),
                     ("runc", "--root", str(root / "runtime-state"), "delete", "-f", "sbx-int"),
                     ("zfs", "destroy", "-r", "pool/crab/sbx-int"),
                 ],

@@ -99,6 +99,65 @@ def _event(
     )
 
 class HostInspectorServerTests(unittest.TestCase):
+    def test_conservative_filesystem_marker_survives_status_until_reset(self) -> None:
+        daemon = HostInspectorDaemon(
+            resolver=FakeResolver(),
+            fs_monitor=FakeFilesystemMonitor(),
+            process_poll_interval_s=60.0,
+        )
+        server = HostInspectorServer(host="127.0.0.1", port=0, daemon=daemon)
+        server.start()
+        client = HostInspectorServiceClient(
+            f"http://127.0.0.1:{server.port}", timeout_s=1.0
+        )
+        try:
+            with patch(
+                "crab.host_inspector.server.list_cgroup_pids",
+                return_value={111},
+            ), patch(
+                "crab.host_inspector.server.reset_soft_dirty_for_pids",
+                return_value={111},
+            ), patch(
+                "crab.host_inspector.server.dirty_pids", return_value=set()
+            ), patch(
+                "crab.host_inspector.server.all_deleted_mmap_paths",
+                return_value=frozenset(),
+            ):
+                client.register_sandbox(
+                    SandboxId("sbx-dirty"), "docker", "container-1"
+                )
+                client.reset_sandbox(SandboxId("sbx-dirty"), None)
+                client.mark_filesystem_changed(
+                    SandboxId("sbx-dirty"), reason="isolated exec"
+                )
+
+                dirty = client.get_proc_and_fs_status(
+                    SandboxId("sbx-dirty")
+                )["status"]
+                self.assertTrue(dirty["filesystem_changed"])
+                self.assertEqual(
+                    dirty["metadata"]["unreconciled_fs_events"][-1]["reason"],
+                    "isolated exec",
+                )
+
+                client.reset_sandbox(SandboxId("sbx-dirty"), None)
+                clean = client.get_proc_and_fs_status(
+                    SandboxId("sbx-dirty")
+                )["status"]
+                self.assertFalse(clean["filesystem_changed"])
+
+                first_unregister = client.unregister_sandbox(
+                    SandboxId("sbx-dirty")
+                )
+                second_unregister = client.unregister_sandbox(
+                    SandboxId("sbx-dirty")
+                )
+                self.assertTrue(first_unregister["unregistered"])
+                self.assertTrue(second_unregister["already_absent"])
+        finally:
+            client.close()
+            server.stop()
+
     def test_server_closes_idle_connections_so_one_client_does_not_pin_only_worker(self) -> None:
         daemon = HostInspectorDaemon(resolver=FakeResolver(), fs_monitor=FakeFilesystemMonitor(), process_poll_interval_s=60.0)
         server = HostInspectorServer(host="127.0.0.1", port=0, daemon=daemon, max_workers=1)
@@ -200,6 +259,83 @@ class HostInspectorServerTests(unittest.TestCase):
         unregistered = daemon.unregister("sbx-1")
         self.assertTrue(unregistered["unregistered"])
         self.assertIn("sbx-1", fs_monitor.removals)
+
+    def test_checkpoint_reset_stabilizes_idle_criu_residual(self) -> None:
+        """A checkpoint reset (captures_process=True) must scrub the soft-dirty
+        residue CRIU's --leave-running dump leaves behind so an idle sandbox
+        does not latch a false process_changed=True.
+
+        The first verification scan sees the residual page; a follow-up clear
+        settles it (idle process, no ongoing writes) and the sandbox reports
+        process_changed=False.
+        """
+        resolver = FakeResolver()
+        fs_monitor = FakeFilesystemMonitor()
+        daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
+        daemon.register("sbx-1", "docker", "container-1")
+
+        scan_returns = [{111}, set()]
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.all_deleted_mmap_paths", return_value=frozenset()
+        ), patch(
+            "crab.host_inspector.process_monitor.clear_soft_dirty"
+        ) as clear, patch(
+            "crab.host_inspector.process_monitor.dirty_pids", side_effect=scan_returns
+        ), patch("crab.host_inspector.process_monitor.time.sleep"):
+            reset = daemon.reset("sbx-1", captures_process=True)
+
+        self.assertFalse(reset["process_changed"])
+        self.assertEqual(reset["metadata"]["baseline_pids"], [111])
+        # initial clear of the tracked pid + one re-clear of the CRIU residual.
+        self.assertEqual(clear.call_count, 2)
+
+    def test_checkpoint_reset_does_not_mask_busy_process(self) -> None:
+        """Reverse guard: a process that keeps writing must survive the
+        stabilization loop. Every verification scan still reports it dirty, so
+        the re-clears are bounded and the next status() poll reports the real
+        activity as process_changed=True.
+        """
+        resolver = FakeResolver()
+        fs_monitor = FakeFilesystemMonitor()
+        daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
+        daemon.register("sbx-1", "docker", "container-1")
+
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.all_deleted_mmap_paths", return_value=frozenset()
+        ), patch("crab.host_inspector.process_monitor.clear_soft_dirty"), patch(
+            "crab.host_inspector.process_monitor.dirty_pids", return_value={111}
+        ), patch("crab.host_inspector.process_monitor.time.sleep"):
+            daemon.reset("sbx-1", captures_process=True)
+
+        # After the (bounded) stabilization, a status() poll that still sees the
+        # pid dirty must report the real write activity, not swallow it.
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.server.dirty_pids", return_value={111}
+        ):
+            status = daemon.status("sbx-1")
+        self.assertTrue(status["process_changed"])
+        self.assertEqual(status["metadata"]["dirty_pids"], [111])
+
+    def test_non_checkpoint_reset_skips_stabilization(self) -> None:
+        """A plain baseline reset (captures_process=False) has no CRIU dump, so
+        it must keep the cheap single-clear path and never run the verification
+        scan.
+        """
+        resolver = FakeResolver()
+        fs_monitor = FakeFilesystemMonitor()
+        daemon = HostInspectorDaemon(resolver=resolver, fs_monitor=fs_monitor, process_poll_interval_s=60.0)
+        daemon.register("sbx-1", "docker", "container-1")
+
+        with patch("crab.host_inspector.server.list_cgroup_pids", return_value={111}), patch(
+            "crab.host_inspector.process_monitor.clear_soft_dirty"
+        ) as clear, patch(
+            "crab.host_inspector.process_monitor.dirty_pids"
+        ) as scan:
+            reset = daemon.reset("sbx-1")
+
+        self.assertFalse(reset["process_changed"])
+        self.assertEqual(clear.call_count, 1)
+        scan.assert_not_called()
 
     def test_status_reports_dirty_memory_for_current_live_pid(self) -> None:
         resolver = FakeResolver()

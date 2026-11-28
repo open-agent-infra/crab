@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from integrations.sandboxes.runtime.baseline import apply_sandbox_process_baseline
 from integrations.sandboxes.runtime.image import ImageRuntimeDefaults
 
 
@@ -369,4 +370,8 @@ def write_bundle_config(
         )
     cfg["root"]["path"] = "rootfs"
     cfg["root"]["readonly"] = False
+    apply_sandbox_process_baseline(cfg)
+    # The default `runc spec` leaves hostname as "runc"; use the sandbox id so
+    # each sandbox is individually identifiable from inside (e.g. `hostname`).
+    cfg["hostname"] = sandbox_name
     config_path.write_text(json.dumps(cfg, indent=2))

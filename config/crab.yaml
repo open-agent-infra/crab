@@ -15,6 +15,22 @@ max_workers: 2
 # this prefix when --zpool is supplied.
 zfs_dataset_prefix: crab/sandboxes
 
+# Alternative CoW backend: btrfs subvolumes instead of ZFS datasets.
+# Prepare the mount with `install-ubuntu.sh --fs-backend btrfs` (or mount a
+# btrfs filesystem manually), then switch the two lines below on. Per-snapshot
+# byte stats need qgroups and are off by default (btrfs_qgroups_enabled).
+# filesystem_backend: btrfs
+# btrfs_root: /var/lib/crab/btrfs
+
+# Third backend: overlayfs rootfs (lowerdir = shared image content,
+# upperdir/workdir = per-sandbox btrfs subvolumes). Needs the same btrfs
+# mount (`install-ubuntu.sh --fs-backend overlay` prepares it); the overlay
+# area defaults to `<btrfs_root>/overlay` (override with overlay_root).
+# Not for docker-in-sandbox workloads: the kernel rejects nested overlay
+# uppers — keep those on zfs/btrfs. qgroups stats cover the upper only.
+# filesystem_backend: overlay
+# btrfs_root: /var/lib/crab/btrfs
+
 storage_planes:
   runtime_root: /var/lib/crab/runtime
   storage_root: /var/lib/crab/checkpoints
@@ -22,10 +38,26 @@ storage_planes:
   work_dir_host_root: /var/lib/crab/work
   image_cache_root: /var/lib/crab/images
 
-# The no-key smoke test does not require a sandbox network or LLM proxy.
-# Agent-specific examples can enable these in their own config.
+# Public Docker Hub images are pulled on first use, then exported into the
+# bounded immutable rootfs cache. Set pull_policy: never on sealed hosts.
+images:
+  pull_policy: if-not-present
+  allowed_registries:
+    - docker.io
+  allowed_references: []
+  pull_timeout_seconds: 600
+  max_image_bytes: 8589934592
+  cache_max_bytes: 21474836480
+  min_free_bytes: 2147483648
+  cache_retention_seconds: 2592000
+  prewarm: []
+  required_prewarm: []
+
+# Use a dedicated network namespace for new runc sandboxes by default. Set a
+# sandbox's public `network` option to false only for an explicit host-network
+# compatibility case. LLM interception remains independently disabled below.
 network:
-  enable_sandbox_network: false
+  enable_sandbox_network: true
 
 interceptor:
   enabled: false
@@ -54,7 +86,7 @@ scheduler:
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
-  incremental_process_enabled: false
+  incremental_process_enabled: true
 
 runc:
   command_timeout_seconds: 120.0

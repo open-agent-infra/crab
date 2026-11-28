@@ -73,6 +73,21 @@ class DelegatingCheckpointManager(CheckpointManager):
     def put_manifest(self, manifest: CheckpointManifest) -> None:
         self._delegate.put_manifest(manifest)
 
+    def set_runtime_image_path_in_use(self, callback) -> None:
+        """Forward the late-bound runtime safety predicate to the wrapped
+        manager (system wiring installs it via getattr, which would
+        otherwise stop at this wrapper)."""
+        setter = getattr(self._delegate, "set_runtime_image_path_in_use", None)
+        if callable(setter):
+            setter(callback)
+
+    def set_destroy_filesystem_ref(self, callback) -> None:
+        """Forward the late-bound filesystem-ref destroy hook to the
+        wrapped manager (see ``set_runtime_image_path_in_use``)."""
+        setter = getattr(self._delegate, "set_destroy_filesystem_ref", None)
+        if callable(setter):
+            setter(callback)
+
     def get_manifest(
         self,
         sandbox_id: SandboxId,

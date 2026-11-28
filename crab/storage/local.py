@@ -12,7 +12,6 @@ from ..contracts import CheckpointManager
 from ..ids import CheckpointId, SandboxId
 from ..json_codec import get_json_codec
 from ..models import ArtifactPayload, ArtifactReference, CheckpointManifest
-from ..runtime import CommandRunner, SubprocessCommandRunner
 
 logger = logging.getLogger(__name__)
 _STORAGE_JSON_CODEC = get_json_codec("auto")
@@ -33,16 +32,13 @@ class LocalCheckpointManager(CheckpointManager):
         self,
         config: StorageConfig,
         *,
-        command_runner: CommandRunner | None = None,
-        zfs_bin: str = "zfs",
         runtime_image_path_in_use: Callable[[Path], bool] | None = None,
+        destroy_filesystem_ref: Callable[[str], None] | None = None,
     ):
         self._config = config
         self._root = Path(config.root_dir)
         self._manifests_root = self._root / config.manifests_dirname
         self._artifacts_root = self._root / config.artifacts_dirname
-        self._runner = command_runner or SubprocessCommandRunner()
-        self._zfs_bin = zfs_bin
         # Optional runtime-side predicate consulted before ``shutil.rmtree``-ing
         # a runtime checkpoint tree. Returns True when the tree (or a
         # descendant) is the on-disk image source for an active runtime
@@ -54,8 +50,24 @@ class LocalCheckpointManager(CheckpointManager):
         # will reclaim it. None means "no safety check installed" (e.g.
         # in-memory tests, runtimes without lazy-pages support).
         self._runtime_image_path_in_use = runtime_image_path_in_use
+        # Runtime-side hook that destroys a filesystem checkpoint by its
+        # opaque fs_ref (routed to the runtime's filesystem provider).
+        # Storage used to shell out `zfs destroy` itself; backend-specific
+        # commands now live behind the provider. None means "no hook
+        # installed" (in-memory tests, runtimes without fs checkpoints) —
+        # retention then skips snapshot cleanup and logs at debug.
+        self._destroy_filesystem_ref = destroy_filesystem_ref
         self._manifests_root.mkdir(parents=True, exist_ok=True)
         self._artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    def set_destroy_filesystem_ref(
+        self,
+        callback: Callable[[str], None] | None,
+    ) -> None:
+        """Late-bind the filesystem-ref destroy hook. Used when storage is
+        constructed before the runtime instance is available (same
+        pattern as ``set_runtime_image_path_in_use``)."""
+        self._destroy_filesystem_ref = callback
 
     def set_runtime_image_path_in_use(
         self,
@@ -316,7 +328,8 @@ class LocalCheckpointManager(CheckpointManager):
         if descendants:
             if not cascade:
                 raise RuntimeError(
-                    "refusing to delete checkpoint with live incremental descendants: "
+                    "refusing to delete checkpoint with live incremental descendants "
+                    "or logical restore dependents: "
                     f"sandbox={sandbox_id} checkpoint={checkpoint_id} "
                     f"descendants={[str(d) for d in descendants]} "
                     "(pass cascade=True to drop the whole chain)"
@@ -350,15 +363,19 @@ class LocalCheckpointManager(CheckpointManager):
         sandbox_id: SandboxId,
         checkpoint_id: CheckpointId,
     ) -> list[CheckpointId]:
-        """Transitive descendants whose `parent_checkpoint_id` chain
-        bottoms out at ``checkpoint_id``. Returned newest-first so callers
-        deleting them in order never orphan a child.
+        """Transitive incremental or logical-restore descendants.
+
+        Logical checkpoints explicitly reference the physical process and
+        filesystem manifests they reuse. Treat those references like parent
+        edges so direct deletion cannot leave an apparently valid logical id
+        dangling. Returned newest-first so cascade deletion never orphans a
+        child.
         """
         sandbox_dir = self._manifests_root / str(sandbox_id)
         if not sandbox_dir.exists():
             return []
 
-        parent_by_child: dict[CheckpointId, CheckpointId] = {}
+        parents_by_child: dict[CheckpointId, set[CheckpointId]] = {}
         order: dict[CheckpointId, str] = {}
         for path in sandbox_dir.glob("*.json"):
             try:
@@ -372,7 +389,21 @@ class LocalCheckpointManager(CheckpointManager):
             order[cid] = str(raw.get("created_at", ""))
             parent_raw = raw.get("parent_checkpoint_id")
             if parent_raw is not None:
-                parent_by_child[cid] = CheckpointId(str(parent_raw))
+                parents_by_child.setdefault(cid, set()).add(
+                    CheckpointId(str(parent_raw))
+                )
+            metadata = raw.get("metadata")
+            if isinstance(metadata, dict):
+                for metadata_key in (
+                    "process_restore_checkpoint_id",
+                    "filesystem_restore_checkpoint_id",
+                ):
+                    dependency_raw = metadata.get(metadata_key)
+                    if dependency_raw is None:
+                        continue
+                    dependency = CheckpointId(str(dependency_raw))
+                    if dependency != cid:
+                        parents_by_child.setdefault(cid, set()).add(dependency)
 
         target = checkpoint_id
         descendants: set[CheckpointId] = set()
@@ -380,8 +411,8 @@ class LocalCheckpointManager(CheckpointManager):
         frontier = {target}
         while frontier:
             next_frontier: set[CheckpointId] = set()
-            for cid, parent in parent_by_child.items():
-                if parent in frontier and cid not in descendants and cid != target:
+            for cid, parents in parents_by_child.items():
+                if parents.intersection(frontier) and cid not in descendants and cid != target:
                     descendants.add(cid)
                     next_frontier.add(cid)
             frontier = next_frontier
@@ -480,29 +511,35 @@ class LocalCheckpointManager(CheckpointManager):
         shutil.rmtree(path, ignore_errors=True)
 
     def _delete_filesystem_runtime_paths(self, payload: dict[str, object]) -> None:
-        snapshot = None
+        # Prefer the backend-neutral fs_ref; fall back to the legacy bare
+        # `snapshot` key so checkpoints written before the fs_ref cutover
+        # (and their retention) keep working. The provider accepts both
+        # spellings.
+        fs_ref = None
         filesystem = payload.get("filesystem", {})
         if isinstance(filesystem, dict):
-            snapshot = filesystem.get("snapshot")
-        if snapshot is None:
+            fs_ref = filesystem.get("fs_ref") or filesystem.get("snapshot")
+        if fs_ref is None:
             status = payload.get("status", {})
             if isinstance(status, dict):
                 metadata = status.get("metadata", {})
                 if isinstance(metadata, dict):
-                    snapshot = metadata.get("snapshot")
-        if snapshot is None:
+                    fs_ref = metadata.get("fs_ref") or metadata.get("snapshot")
+        if fs_ref is None:
             return
-        result = self._runner.run([self._zfs_bin, "destroy", str(snapshot)])
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            if "dataset does not exist" in stderr or "snapshot does not exist" in stderr:
-                return
-            logger.warning(
-                "Failed to destroy filesystem snapshot %s rc=%d stderr=%s",
-                snapshot,
-                result.returncode,
-                stderr,
+        destroy = self._destroy_filesystem_ref
+        if destroy is None:
+            logger.debug(
+                "No destroy_filesystem_ref hook installed; skipping filesystem checkpoint cleanup for %s",
+                fs_ref,
             )
+            return
+        try:
+            destroy(str(fs_ref))
+        except Exception:
+            # Retention is best-effort; a failed snapshot destroy must not
+            # wedge manifest/artifact deletion.
+            logger.exception("destroy_filesystem_ref hook raised for %s", fs_ref)
 
     def _prune_empty_parents(self, start: Path, *, stop: Path) -> None:
         current = start

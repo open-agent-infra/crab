@@ -6,6 +6,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from benchmarks.diagnose import (
@@ -238,19 +239,28 @@ class BenchmarkDiagnoseTests(unittest.TestCase):
             ),
         )
         log_path = base / "logs" / "run.log"
+
+        # Log lines carry naive local-time timestamps and the diagnoser
+        # interprets them in the machine's local timezone, while the iflow
+        # session fixture pins UTC instants. Render the log timestamps from
+        # UTC instants so the two align regardless of the host timezone.
+        def _log_ts(iso_utc: str) -> str:
+            instant = datetime.fromisoformat(iso_utc).replace(tzinfo=timezone.utc)
+            return instant.astimezone().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+
         self._write(
             log_path,
             textwrap.dedent(
                 f"""\
-                2026-03-23 21:00:00,000 INFO benchmarks.real_host_scenario_base: runc --root {actual_root}/runtime-state state fault-54
-                2026-03-23 21:32:10,000 INFO crab.scheduler: Scheduler selected checkpoint for sandbox fault-54 reason=llm_request_window_available observed_process_changed=False observed_filesystem_changed=False checkpoint_process=True checkpoint_filesystem=True leave_running=True
-                2026-03-23 21:32:20,000 INFO crab.executor: Finished checkpoint job job-1 for sandbox fault-54 with status=succeeded checkpoint=ckpt-1
-                2026-03-23 21:32:25,000 INFO benchmarks.real_host_scenario_base: Benchmark notifying fault sandbox=fault-54 reason=fault
-                2026-03-23 21:32:35,000 INFO crab.system: Recovery restore succeeded sandbox=fault-54 checkpoint=ckpt-1
-                2026-03-23 21:32:40,000 INFO benchmarks.real_host_scenario_base: Completed run-tests.sh sandbox=fault-54 exit_code=1 command=/bin/bash -lc 'bash /tests/run-tests.sh'
-                2026-03-23 21:32:40,100 WARNING benchmarks.real_host_scenario_base: run-tests stderr sandbox=fault-54
+                {_log_ts("2026-03-23T13:00:00")} INFO benchmarks.real_host_scenario_base: runc --root {actual_root}/runtime-state state fault-54
+                {_log_ts("2026-03-23T13:32:10")} INFO crab.scheduler: Scheduler selected checkpoint for sandbox fault-54 reason=llm_request_window_available observed_process_changed=False observed_filesystem_changed=False checkpoint_process=True checkpoint_filesystem=True leave_running=True
+                {_log_ts("2026-03-23T13:32:20")} INFO crab.executor: Finished checkpoint job job-1 for sandbox fault-54 with status=succeeded checkpoint=ckpt-1
+                {_log_ts("2026-03-23T13:32:25")} INFO benchmarks.real_host_scenario_base: Benchmark notifying fault sandbox=fault-54 reason=fault
+                {_log_ts("2026-03-23T13:32:35")} INFO crab.system: Recovery restore succeeded sandbox=fault-54 checkpoint=ckpt-1
+                {_log_ts("2026-03-23T13:32:40")} INFO benchmarks.real_host_scenario_base: Completed run-tests.sh sandbox=fault-54 exit_code=1 command=/bin/bash -lc 'bash /tests/run-tests.sh'
+                {_log_ts("2026-03-23T13:32:40.100")} WARNING benchmarks.real_host_scenario_base: run-tests stderr sandbox=fault-54
                 E: Version '1.2.3' for 'curl' was not found
-                2026-03-23 21:32:40,200 WARNING benchmarks.real_host_scenario_base: binary missing for sandbox=fault-54 task_id=task-a
+                {_log_ts("2026-03-23T13:32:40.200")} WARNING benchmarks.real_host_scenario_base: binary missing for sandbox=fault-54 task_id=task-a
                 """
             ),
         )

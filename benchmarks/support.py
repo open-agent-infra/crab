@@ -226,43 +226,9 @@ def resolve_work_dir_host_path(work_dir_host_root: Path | None, sandbox_name: st
     return work_dir_host_root.expanduser().resolve() / sandbox_name
 
 
-def resolve_checkpoint_copy_plan(
-    checkpoint_order: list[CheckpointId],
-    manifests: dict[CheckpointId, CheckpointManifest],
-    checkpoint_id: CheckpointId,
-) -> list[tuple[CheckpointId, bool, bool]]:
-    manifest = manifests[checkpoint_id]
-    plan: list[tuple[CheckpointId, bool, bool]] = [
-        (checkpoint_id, bool(manifest.process_artifacts), bool(manifest.filesystem_artifacts))
-    ]
-    need_process = not bool(manifest.process_artifacts)
-    need_filesystem = not bool(manifest.filesystem_artifacts)
-    if not need_process and not need_filesystem:
-        return plan
-
-    try:
-        current_index = checkpoint_order.index(checkpoint_id)
-        candidates = list(reversed(checkpoint_order[:current_index]))
-    except ValueError:
-        candidates = list(reversed(checkpoint_order))
-
-    for candidate_id in candidates:
-        if not need_process and not need_filesystem:
-            break
-        candidate = manifests[candidate_id]
-        copy_process = need_process and bool(candidate.process_artifacts)
-        copy_filesystem = need_filesystem and bool(candidate.filesystem_artifacts)
-        if not copy_process and not copy_filesystem:
-            continue
-        plan.insert(0, (candidate_id, copy_process, copy_filesystem))
-        if copy_process:
-            need_process = False
-        if copy_filesystem:
-            need_filesystem = False
-
-    if need_process or need_filesystem:
-        raise ValueError(f"unable to resolve restore dependencies for checkpoint {checkpoint_id}")
-    return plan
+# Moved to crab.forking as part of the fork wiring (task A3); re-exported
+# here so existing benchmark imports keep working unchanged.
+from crab.forking import resolve_checkpoint_copy_plan  # noqa: E402,F401
 
 
 @dataclass(frozen=True)

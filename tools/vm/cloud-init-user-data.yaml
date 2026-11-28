@@ -1,0 +1,57 @@
+#cloud-config
+# crab development VM — cloud-init user-data
+# The provision script substitutes __SSH_PUBLIC_KEY__ before boot.
+
+hostname: crab-dev
+disable_root: false
+ssh_pwauth: false
+
+users:
+  - name: root
+    ssh_authorized_keys:
+      - __SSH_PUBLIC_KEY__
+
+package_update: true
+packages:
+  # toolchain (host_inspector eBPF build + general)
+  - build-essential
+  - pkg-config
+  - clang
+  - llvm
+  - git
+  - rsync
+  - curl
+  - ca-certificates
+  - software-properties-common
+  # eBPF build/runtime
+  - libbpf-dev
+  - libelf-dev
+  - zlib1g-dev
+  # crab runtime stack (criu comes from the PPA in runcmd: Ubuntu dropped
+  # the criu package from the noble archive)
+  - docker.io
+  - runc
+  - zfsutils-linux
+  # btrfs backend work (FilesystemProvider Phase 2)
+  - btrfs-progs
+  # Python
+  - python3-venv
+  - python3-dev
+  - python3-pip
+
+runcmd:
+  # The cloud image ships the "virtual" kernel flavour; zfs.ko/btrfs.ko live
+  # in linux-modules-extra for the running ABI. Install it and load both
+  # modules so scripts/install-ubuntu.sh can create the crab zpool.
+  - apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+  # criu has no installation candidate in noble; the CRIU project's PPA is
+  # the upstream-recommended source.
+  - add-apt-repository -y ppa:criu/ppa
+  - apt-get update
+  - apt-get install -y criu
+  - modprobe zfs
+  - modprobe btrfs
+  # Phase 3 (overlayfs spike) probes /proc/filesystems; load at boot.
+  - modprobe overlay
+  - printf 'zfs\nbtrfs\noverlay\n' > /etc/modules-load.d/crab.conf
+  - systemctl enable --now docker

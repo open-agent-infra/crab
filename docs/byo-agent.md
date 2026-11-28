@@ -225,6 +225,6 @@ When `agent.install()` or `agent.execute()` is called:
    anything.
 
 The daemon config must enable both the interceptor and sandbox networking for
-in-sandbox agents that declare `requires_network_namespace = True`. The default
-no-key smoke-test config intentionally disables them; see
-[Configuration](configuration-reference.md#network-and-llm-interception).
+in-sandbox agents that declare `requires_network_namespace = True`. The
+packaged config enables sandbox networking but leaves interception disabled;
+see [Configuration](configuration-reference.md#network-and-llm-interception).

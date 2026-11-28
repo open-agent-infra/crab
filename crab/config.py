@@ -18,7 +18,7 @@ class SchedulerConfig:
     prefer_checkpoint_during_llm_request: bool = True
     require_llm_request_for_checkpoint: bool = False
     inspect_without_pause: bool = False
-    incremental_process_enabled: bool = False
+    incremental_process_enabled: bool = True
     full_process_checkpoint_interval: int = 8
     max_process_chain_length: int = 16
 
@@ -97,12 +97,18 @@ class StorageConfig:
     root_dir: Path
     manifests_dirname: str = "manifests"
     artifacts_dirname: str = "artifacts"
+    journal_dirname: str = "journal"
+    cassettes_dirname: str = "cassettes"
 
     def __post_init__(self) -> None:
         if not self.manifests_dirname:
             raise ValueError("manifests_dirname must be non-empty")
         if not self.artifacts_dirname:
             raise ValueError("artifacts_dirname must be non-empty")
+        if not self.journal_dirname:
+            raise ValueError("journal_dirname must be non-empty")
+        if not self.cassettes_dirname:
+            raise ValueError("cassettes_dirname must be non-empty")
 
 
 @dataclass(frozen=True)

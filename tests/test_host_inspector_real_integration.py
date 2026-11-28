@@ -840,12 +840,25 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
             runtime_id_before = str(status_before["runtime_id"])
             total_before = int(status_before["total_actions"])
 
-            _wait_for(lambda: request_state_store.get(sandbox_id).llm_request_in_flight, timeout_s=20.0)
             _wait_for(
                 lambda: self._host_status_changed(host_client, sandbox_id),
                 timeout_s=20.0,
             )
-            inspected = system.inspector.inspect(sandbox_id)
+            # The simulated LLM answers in ~250ms, so a snapshot taken after
+            # a separate wait usually misses the in-flight window. The agent
+            # keeps issuing requests, so sample the inspector inside the wait
+            # predicate and keep the snapshot that caught the window.
+            inflight_snapshot: dict[str, object] = {}
+
+            def _catch_inflight_window() -> bool:
+                snap = system.inspector.inspect(sandbox_id)
+                if bool(snap.metadata["llm_request_in_flight"]):
+                    inflight_snapshot["snapshot"] = snap
+                    return True
+                return False
+
+            _wait_for(_catch_inflight_window, timeout_s=20.0)
+            inspected = inflight_snapshot["snapshot"]
             self.assertTrue(bool(inspected.metadata["llm_request_in_flight"]))
             self.assertTrue(inspected.process_changed or inspected.filesystem_changed)
 
@@ -854,7 +867,10 @@ class HostInspectorRealIntegrationTests(unittest.TestCase):
             assert checkpoint_result is not None
             self.assertEqual(checkpoint_result.status, JobStatus.SUCCEEDED)
             scheduler_events = [attrs for name, attrs in telemetry.events if name == "scheduler.evaluate"]
-            self.assertTrue(any(x["reason"] == "llm_request_window_available" for x in scheduler_events))
+            # checkpoint_full_baseline_on_first_checkpoint defaults to True, so
+            # the first checkpoint is an unconditional full baseline; that
+            # branch outranks the llm-window reason in the scheduler.
+            self.assertTrue(any(x["reason"] == "no_previous_checkpoint" for x in scheduler_events))
 
             tamper_path = work_dir / "host_tamper.txt"
             tamper_path.write_text("tampered\n", encoding="utf-8")

@@ -135,7 +135,18 @@ class AdapterProcessRWorker(ProcessRWorker):
             checkpoint_dir = Path(str(image_path))
             if not checkpoint_dir.exists():
                 raise FileNotFoundError(f"process checkpoint directory not found: {checkpoint_dir}")
-        status = self._runtime.restore_process(job.sandbox_id, restore_checkpoint_id)
+        lazy_pages = job.metadata.get("lazy_pages")
+        if lazy_pages is not None and self._runtime.capabilities().supports_lazy_restore:
+            # Per-call override threaded from RestoreJob metadata (fork
+            # restores set it; see Engine.fork_sandbox). Runtimes without
+            # lazy-restore support ignore the request.
+            status = self._runtime.restore_process(
+                job.sandbox_id,
+                restore_checkpoint_id,
+                lazy_pages=bool(lazy_pages),
+            )
+        else:
+            status = self._runtime.restore_process(job.sandbox_id, restore_checkpoint_id)
         logger.debug(
             "Process restore worker finished for sandbox=%s checkpoint=%s restore_checkpoint=%s executed=%s",
             job.sandbox_id,

@@ -354,7 +354,13 @@ class InterceptorTests(unittest.TestCase):
                 ).encode("utf-8"),
             )
 
-            self.assertTrue(system.has_pending_interceptor_signal(SandboxId("sbx-2")))
+            # notify_interceptor_state_change reconciles against the actual
+            # response-gate state instead of unconditionally marking the
+            # sandbox pending (an unconditional add would leak the sandbox
+            # forever in manual mode). This request completed synchronously
+            # with no gated response, so no pending signal remains — but the
+            # notification path itself must have fired.
+            self.assertFalse(system.has_pending_interceptor_signal(SandboxId("sbx-2")))
             event_names = [name for name, _ in system.telemetry.events]
             self.assertIn("interceptor.state_changed", event_names)
             system.executor.shutdown()
@@ -656,8 +662,8 @@ class InterceptorTests(unittest.TestCase):
                 "Content-Type": "application/json",
                 "X-Agent-Sandbox-Id": "sbx-metrics",
                 "X-Request-Id": "req-metrics",
-                "X-Agentcr-Spec-Pair-Id": "pair-metrics",
-                "X-Agentcr-Spec-Role": "oracle",
+                "X-Crab-Spec-Pair-Id": "pair-metrics",
+                "X-Crab-Spec-Role": "oracle",
             },
             body=b"{}",
         )

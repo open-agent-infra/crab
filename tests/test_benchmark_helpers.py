@@ -1193,6 +1193,81 @@ class BenchmarkHelperTests(unittest.TestCase):
             ],
         )
 
+    def test_resolve_checkpoint_copy_plan_uses_logical_manifest_sources(self) -> None:
+        sid = SandboxId("sbx")
+        checkpoint_order = [
+            CheckpointId("ckpt-process-source"),
+            CheckpointId("ckpt-filesystem-source"),
+            CheckpointId("ckpt-newer-unrelated"),
+            CheckpointId("ckpt-logical"),
+        ]
+        process_ref = ArtifactReference(
+            kind=ArtifactKind.PROCESS,
+            name="process_checkpoint.json",
+            relative_path="artifacts/sbx/process/process_checkpoint.json",
+            size_bytes=1,
+            sha256="0" * 64,
+            metadata={},
+        )
+        filesystem_ref = ArtifactReference(
+            kind=ArtifactKind.FILESYSTEM,
+            name="filesystem_checkpoint.json",
+            relative_path="artifacts/sbx/filesystem/filesystem_checkpoint.json",
+            size_bytes=1,
+            sha256="1" * 64,
+            metadata={},
+        )
+
+        def _manifest(
+            checkpoint_id: str,
+            *,
+            process: bool = False,
+            filesystem: bool = False,
+            metadata: dict[str, object] | None = None,
+        ) -> CheckpointManifest:
+            return CheckpointManifest(
+                schema_version="v1",
+                checkpoint_id=CheckpointId(checkpoint_id),
+                sandbox_id=sid,
+                created_at=utc_now(),
+                runtime_name="runc",
+                runtime_version=None,
+                process_artifacts=[process_ref] if process else [],
+                filesystem_artifacts=[filesystem_ref] if filesystem else [],
+                metadata=metadata or {},
+            ).with_integrity()
+
+        manifests = {
+            CheckpointId("ckpt-process-source"): _manifest(
+                "ckpt-process-source", process=True
+            ),
+            CheckpointId("ckpt-filesystem-source"): _manifest(
+                "ckpt-filesystem-source", filesystem=True
+            ),
+            CheckpointId("ckpt-newer-unrelated"): _manifest(
+                "ckpt-newer-unrelated", process=True, filesystem=True
+            ),
+            CheckpointId("ckpt-logical"): _manifest(
+                "ckpt-logical",
+                metadata={
+                    "logical_checkpoint": True,
+                    "process_restore_checkpoint_id": "ckpt-process-source",
+                    "filesystem_restore_checkpoint_id": "ckpt-filesystem-source",
+                },
+            ),
+        }
+
+        self.assertEqual(
+            resolve_checkpoint_copy_plan(
+                checkpoint_order, manifests, CheckpointId("ckpt-logical")
+            ),
+            [
+                (CheckpointId("ckpt-process-source"), True, False),
+                (CheckpointId("ckpt-filesystem-source"), False, True),
+                (CheckpointId("ckpt-logical"), False, False),
+            ],
+        )
+
     def test_bounded_probability_rejects_invalid_values(self) -> None:
         self.assertEqual(bounded_probability("0.3"), 0.3)
         with self.assertRaises(Exception):
@@ -1378,6 +1453,35 @@ class BenchmarkHelperTests(unittest.TestCase):
             )
             self.assertTrue(work_dir_host_path.is_dir())
             self.assertEqual(payload["process"]["cwd"], "/work")
+
+    def test_write_bundle_config_sets_hostname_to_sandbox_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle_dir = Path(tmp)
+            config_path = bundle_dir / "config.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "hostname": "runc",
+                        "linux": {"namespaces": [], "seccomp": {"defaultAction": "SCMP_ACT_ERRNO"}},
+                        "mounts": [],
+                        "process": {"terminal": True, "cwd": "/", "args": [], "env": []},
+                        "root": {"path": "rootfs", "readonly": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            sandbox_bundle.write_bundle_config(
+                bundle_dir=bundle_dir,
+                llm_base_url="http://127.0.0.1:9000/v1",
+                provider="openai",
+                sandbox_name="sbx-abc123",
+                status_port=9001,
+                cgroup_path="crab/test/sbx-abc123",
+            )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["hostname"], "sbx-abc123")
 
     def test_write_bundle_config_inherits_image_env_workdir_and_user(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2119,7 +2223,10 @@ class BenchmarkHelperTests(unittest.TestCase):
         )
         harness.network_manager.cleanup.assert_called_once_with()
         harness._task_executor.shutdown.assert_called_once_with(wait=True, cancel_futures=True)
-        self.assertEqual(events, ["delete_runtime", "shutdown"])
+        # task_executor.shutdown must run before runtime deletion: deleting
+        # runtimes with in-flight tasks mid-turn makes the next `runc exec`
+        # fail and hang shutdown in a restore-wait (see harness.__exit__).
+        self.assertEqual(events, ["shutdown", "delete_runtime"])
 
     def test_launch_sandbox_from_docker_compose_file_translates_supported_service(self) -> None:
         harness = RealHostScenarioHarness(

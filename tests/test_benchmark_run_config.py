@@ -286,7 +286,7 @@ class BenchmarkConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "scenario='spec' requires agent='mini_swe'"):
+            with self.assertRaisesRegex(ValueError, r"scenario='spec' requires agent in \['mini_swe', 'terminus'\]"):
                 load_config(config_path)
 
     def test_load_config_requires_spec_llm_service_for_spec(self) -> None:
@@ -305,7 +305,7 @@ class BenchmarkConfigTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 ValueError,
-                "scenario='spec' requires llm_service='mini_swe_spec_trace_replay'",
+                "scenario='spec' with agent='mini_swe' requires llm_service='mini_swe_spec_trace_replay'",
             ):
                 load_config(config_path)
 

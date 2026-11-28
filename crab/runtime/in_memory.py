@@ -65,6 +65,15 @@ class InMemoryRuntime(Runtime):
             cur = self._items[sandbox_id]
             self._items[sandbox_id] = replace(cur, status="running")
 
+    def start(self, sandbox_id: SandboxId) -> None:
+        with self._lock:
+            cur = self._items[sandbox_id]
+            self._items[sandbox_id] = replace(cur, status="running")
+
+    def restart(self, sandbox_id: SandboxId) -> None:
+        self.stop(sandbox_id)
+        self.start(sandbox_id)
+
     def sync_runtime_state(self, sandbox_id: SandboxId, *, is_running: bool) -> None:
         with self._lock:
             cur = self._items[sandbox_id]

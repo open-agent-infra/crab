@@ -28,6 +28,26 @@ storage_planes:
 
 - `runtime`: `runc` is the real v0 backend. `docker` selects an in-memory test
   implementation; it is not a Docker checkpoint/restore fallback.
+- `filesystem_backend`: CoW backend for sandbox root filesystems: `zfs`
+  (default), `btrfs`, or `overlay`. Also accepted as a nested block:
+  `filesystem: {backend: btrfs, btrfs: {root: ..., qgroups_enabled: false},
+  overlay: {root: ...}}`.
+- `btrfs_root`: mountpoint of the btrfs filesystem holding sandbox
+  subvolumes (default `/var/lib/crab/btrfs`). Only used with
+  `filesystem_backend: btrfs`; the mount must already exist (the installer's
+  `--fs-backend btrfs` prepares it).
+- `overlay_root`: btrfs-backed area for the overlay backend's per-sandbox
+  upper/work subvolumes, shared lowers, and snapshot mounts (default
+  `<btrfs_root>/overlay`, so a btrfs-prepared host needs no extra setup).
+  Overlay constraints: sandboxes actively reference their shared image
+  lower at runtime (do not delete a shared cache under live sandboxes),
+  nested container engines inside the sandbox are unsupported on overlay
+  roots (the kernel rejects overlay-upon-overlay uppers — use zfs/btrfs),
+  and qgroups byte stats cover the upper subvolume only ("written since
+  launch").
+- `btrfs_qgroups_enabled`: enable qgroups-backed per-snapshot byte stats
+  (measurable overhead; default `false`, stats degrade to unknown). Also
+  governs the overlay backend's stats.
 - `zfs_dataset_prefix`: parent dataset for sandbox root filesystems. Name it
   explicitly; do not rely on automatic pool discovery in production.
 - `storage_root`: checkpoint manifests and artifact metadata.
@@ -37,16 +57,21 @@ storage_planes:
   for one.
 - `image_cache_root`: exported container-image rootfs cache.
 
+Image pull policy, limits, cache retention, and prewarming are configured in
+the `images` block. See [Sandbox runtime baseline](sandbox-runtime-baseline.md#cache-and-pull-policy)
+for the complete example and compatible-image contract.
+
 `Sandbox(work_dir=...)` and `crab sandbox run --work-dir` create host bind
 mounts. Their contents are outside ZFS rollback.
 
 ## Network and LLM interception
 
-The safe default used by the no-key smoke test disables both:
+The packaged configuration enables per-sandbox networking by default while
+leaving LLM interception disabled:
 
 ```yaml
 network:
-  enable_sandbox_network: false
+  enable_sandbox_network: true
 
 interceptor:
   enabled: false
@@ -75,6 +100,12 @@ config, such as
 [`examples/sdk/configs/iflow_replay_engine.runc.yaml`](../examples/sdk/configs/iflow_replay_engine.runc.yaml),
 instead of silently weakening isolation or bypassing interception.
 
+`Sandbox(network=...)` is tri-state: `true` requires an isolated namespace,
+`false` explicitly uses host networking, and omitted/`null` follows the daemon
+default. For runc, the default is isolated whenever sandbox networking is
+enabled; interception is an independent feature. Port exposure is rejected for
+host-network sandboxes. See [Network selection](sandbox-runtime-baseline.md#network-selection).
+
 ## Host inspector
 
 ```yaml
@@ -100,7 +131,7 @@ scheduler:
   prefer_checkpoint_during_llm_request: true
   require_llm_request_for_checkpoint: false
   inspect_without_pause: false
-  incremental_process_enabled: false
+  incremental_process_enabled: true
 ```
 
 Important settings:
@@ -113,8 +144,12 @@ Important settings:
   active intercepted request window.
 - `inspect_without_pause`: live inspection is opt-in; the safer default pauses
   before inspection.
-- `incremental_process_enabled`: opt in to CRIU pre-dump chains. Keep it off
-  until the workload and retention policy have been validated together.
+- `incremental_process_enabled`: use CRIU pre-dump chains when the runtime
+  supports them. This is on by default for runc; runtimes without the
+  capability continue to create standalone full checkpoints. Set it to
+  `false` for workloads that dirty most memory between every checkpoint, or
+  when operating against a custom retention policy that has not been
+  validated with incremental ancestors.
 
 Manual `crab checkpoint create` and `Sandbox.checkpoint()` force a checkpoint;
 they do not wait for the automatic scheduler to become due.
